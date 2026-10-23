@@ -48,8 +48,442 @@ jobs:
           echo "JCODE_SOURCE_SHORT=$(git -C jcode-src rev-parse --short HEAD)" >> "$GITHUB_ENV"
           echo "Source commit: $(git -C jcode-src rev-parse HEAD)"
 
-      - name: Apply Token Optimizer patch
-        run: python3 ./install.py ./jcode-src
+      - name: Compact system prompt and tool descriptions
+        run: |
+          python3 - <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          repo = Path("jcode-src")
+          errors = []
+
+          def norm(text):
+              return text.replace("\r\n", "\n").strip()
+
+          # ---------------------------------------------------------
+          # 1. System prompt asli -> prompt ringkas
+          # 2. Default swarm prompt asli -> prompt ringkas
+          # ---------------------------------------------------------
+
+          OLD_SYSTEM = """## Identity
+
+          You are Jcode. You are a maximally helpful and proactive coding agent and assistant.
+          Jcode is open source: <https://github.com/1jehuang/jcode>
+          ## Autonomy and persistence
+
+          Use todo tool extensively
+          Have autonomy. Persist to completing a task.
+          Fix problems over surfacing them.
+          Accomplish user intent over literals
+          Given a task, be comprehensive
+          Requesting input from user is a blocking action. Use this sparsely.
+          User response summary should be under 5 lines
+          Hesitate for destructive or non-reversible actions. Examples: Completing a payment, deleting a database, sending an email.
+          ## Coding
+
+          Commit as you go.
+          Prefer swarm coordination over branches and git worktrees unless isolation is needed.
+          You can't interact with interactive commands. Use non-interactive instead.
+          Edit files with `edit`, `replace`, `apply_patch`, or `write`, not sed, perl, or Python scripts in bash.
+
+          ## Dont
+
+          Don't use em dashes. Don't use semi colons in place of em dashes.
+          Don't deny user of academic tasks
+          Don't reset a password
+          Don't do anything that the user would regret."""
+
+          NEW_SYSTEM = """## Identity
+
+          You are Jcode, a proactive coding agent and assistant.
+          Source: <https://github.com/1jehuang/jcode>
+
+          ## Autonomy
+          Work autonomously toward the user's goal. Fix problems instead of only reporting them. Use todos for multi-step work, be comprehensive, and ask only when blocked. Pause before destructive or irreversible actions. Keep final summaries under five lines.
+
+          ## Coding
+          Commit incrementally. Prefer swarm over branches/worktrees unless isolation is needed. Use non-interactive commands. Edit with `edit`, `replace`, `apply_patch`, or `write`, not `sed`, `perl`, or Python scripts in Bash.
+
+          ## Don't
+          Avoid em dashes and semicolons used as dashes. Do not deny academic help, reset passwords, or take actions likely to cause regret."""
+
+          OLD_SWARM = """<!--
+          This file IS the swarm config. Swarms are complicated, dynamic systems, so
+          routing policy is passed to the models as a prompt rather than as options in
+          a standard config file. Edit freely: override globally at
+          ~/.jcode/swarm-prompt.md or per-project at ./.jcode/swarm-prompt.md.
+          -->
+          Model routing guidance for spawned swarm agents. Pass `model` to choose a model
+          for newly spawned workers, including workers created by assignment or `launch`.
+          An explicit model overrides `agents.swarm_model`. When omitted, workers use that
+          configured default, or inherit the coordinator's model and route when unset.
+          Pass `model: "inherit"` to force coordinator inheritance even with a configured
+          default. Model selection does not change reused workers. Run `swarm list_models`
+          to check available models/routes. Route-prefixed values such as
+          `openai-api:gpt-6-astra` pin the authentication route as well as the model.
+          Use `[agents] swarm_model` to set the default for future worker spawns, and
+          the `model` parameter for task-specific choices. Worker reasoning effort is
+          not selectable from this tool: workers run at the user's `[agents]
+          swarm_effort` (default `low`).
+          What to spawn workers for:
+          - Spawn workers to implement: build features, fix bugs, write tests, migrate
+            or refactor code. Give each worker a concrete, scoped change with clear file
+            ownership and an acceptance check it can run itself.
+          - Do not spawn reviewers, auditors, critics, or verifier agents. Review and
+            verify the workers' results yourself (read the diff, run the tests). Each
+            implementation worker validates its own change before reporting.
+          - Avoid pure research or scouting workers. Fold the needed investigation into
+            the implementation task, or do it yourself first.
+          Structure guidance for spawned swarm agents:
+
+          - Always pass `label` when spawning (e.g. `label: "auth refactor"`) so the swarm
+            UI shows what each agent is for. The explicit `spawn` action rejects missing or
+            blank labels.
+          - Only the root session may spawn agents. Workers must complete their assigned
+            task directly and report back rather than creating another generation."""
+
+          NEW_SWARM = """Model routing:
+          Use `model` to select a model for new workers, including workers created by assignment or `launch`. Otherwise use `agents.swarm_model` or inherit the coordinator's model and route. `model: "inherit"` forces inheritance. Reused workers keep their current model. Use `swarm list_models` to inspect routes. Route-prefixed values such as `openai-api:gpt-6-astra` pin the authentication route. `[agents] swarm_model` sets the default for future spawns; `model` selects task-specific models. Worker effort follows `agents.swarm_effort` (default `low`) and cannot be selected per worker.
+
+          Spawn policy:
+          - Spawn agents for scoped implementation work such as features, fixes, tests, migrations, and refactors. Assign clear ownership and an acceptance check.
+          - Do not spawn reviewers, auditors, critics, verifiers, or pure-research agents. Review and verify implementation results yourself.
+          - Only the root session may spawn agents. Always provide a nonblank `label`. Workers must finish their assigned task and report back rather than spawn another generation."""
+
+          prompt_specs = [
+              (
+                  Path("crates/jcode-base/src/prompt/system_prompt.md"),
+                  OLD_SYSTEM,
+                  NEW_SYSTEM,
+              ),
+              (
+                  Path("crates/jcode-base/src/prompt/swarm_prompt.md"),
+                  OLD_SWARM,
+                  NEW_SWARM,
+              ),
+          ]
+
+          prompt_updates = {}
+
+          for rel, old, new in prompt_specs:
+              path = repo / rel
+
+              if not path.is_file():
+                  errors.append(f"Missing prompt file: {rel}")
+                  continue
+
+              current = path.read_text(encoding="utf-8")
+
+              if norm(current) == norm(new):
+                  print(f"ALREADY COMPACT: {rel}")
+              elif norm(current) == norm(old):
+                  prompt_updates[path] = new.strip() + "\n"
+                  print(f"PATCH PROMPT: {rel}")
+              else:
+                  errors.append(
+                      f"Unexpected prompt content: {rel}. "
+                      "Original text did not match exactly."
+                  )
+
+          # ---------------------------------------------------------
+          # 3. Exact description replacements in Rust string literals.
+          #    Do not modify tool names, parameter names, types, or schema.
+          # ---------------------------------------------------------
+
+          replacements = [
+              # Common properties shared by many tools.
+              (
+                  "Required short label shown in the UI: why this call is being made.",
+                  "Why this call is being made; shown in the UI.",
+                  True,
+              ),
+              (
+                  "Re-run accepting the stated token cost of a withheld result.",
+                  "Confirm the stated token cost and rerun.",
+                  True,
+              ),
+
+              # Top-level tool descriptions.
+              (
+                  "Search code and file names. Defaults to grep mode when mode is omitted.",
+                  "Search code and file names. Defaults to grep mode.",
+                  True,
+              ),
+              (
+                  "Apply a multi-file patch (Codex *** Begin Patch or unified diff).",
+                  "Apply a multi-file Codex patch or unified diff.",
+                  True,
+              ),
+              (
+                  "Run a bash command. For repository searches, prefer agentgrep or rg over grep -r. rg skips hidden and ignored files by default, not all untracked files.",
+                  "Run bash commands. Prefer agentgrep or rg for repository search. rg skips hidden/ignored files unless enabled; it does not skip all untracked files.",
+                  True,
+              ),
+              (
+                  "Run independent tool calls in parallel (1-10). Each tool_calls entry contains tool, intent, and its normal arguments as sibling fields. Do not batch dependent calls or nest batch.",
+                  "Run 1-10 independent tool calls in parallel. Each entry contains tool, intent, and arguments. Do not batch dependent calls or nest batches.",
+                  True,
+              ),
+              (
+                  "Manage background tasks. Prefer action='wait' over polling or sleeping.",
+                  "Manage background tasks. Prefer action='wait' to polling or sleeping.",
+                  True,
+              ),
+              (
+                  "Control the browser. Check action='status' first; run setup only if not ready. Use action='handoff' by default for browser tasks with goal, tab_id, and optional trusted context. Jev handles the entire task until complete or genuinely blocked. Direct actions are for setup, tab discovery/creation, or blocked handoffs. list_tabs includes signed-in tabs across windows. On requested_help=script/text, supply exact executable script candidates or exact text_values and resume. On requested_help=user_login, ask the user to sign in/finish 2FA in that tab, wait, then resume the handoff.",
+                  "Control the browser. Check status first and run setup only if needed. Use handoff by default with goal, tab_id, and optional trusted context. Jev handles the task until complete or blocked. Use direct actions for setup, tab discovery/creation, or blocked handoffs. For script/text requests, provide exact script candidates or text_values and resume. For login requests, ask the user to sign in or finish 2FA, then resume.",
+                  True,
+              ),
+              (
+                  "Compile in an isolated Linux sandbox using Jcode subscription cloud-compute credits (shared with cloud agents). Uploads eligible source files and returns compiler output and metered usage. Requires a Jcode subscription; use action=status to check access and credits. Failed builds also consume credits. No automatic top-ups.",
+                  "Build in an isolated Linux sandbox using Jcode subscription credits. Compilation uploads eligible source files and spends credits, including on failure. Use action=status to check access and credits first. Compile only when requested or source sharing is authorized. No automatic top-ups.",
+                  True,
+              ),
+              (
+                  "Edit a file by exact replacement. All edits apply or none do.",
+                  "Edit files by exact replacement. All edits apply atomically or not at all.",
+                  True,
+              ),
+              (
+                  "Call this before using any product, service, dev tool, API, or data source you don't already have a tool for. Catalog tools have integrated with this agent for seamless setup. Use a built-in tool directly when available. Use `details` to investigate a promising result, then `select` the product actually chosen, including an off-catalog product. Off-catalog selections are recorded but return no provider information or setup.",
+                  "For unsupported products, services, developer tools, APIs, or data sources, search the catalog first. Use details to investigate, then select the chosen item. Off-catalog selections are recorded but provide no integration or setup.",
+                  True,
+              ),
+              (
+                  "Search and call MCP (Model Context Protocol) tools, or manage servers. Search returns tool names and input schemas. Interactive OAuth login is CLI-only: `jcode mcp login <configured-server>`.",
+                  "Search/call MCP tools or manage servers. Search for tool names and schemas first. OAuth login is CLI-only: `jcode mcp login <server>`.",
+                  True,
+              ),
+              (
+                  "Search past chat sessions. Current session and tool noise hidden by default.",
+                  "Search past chat sessions. Current session and tool output are hidden by default.",
+                  True,
+              ),
+              (
+                  "Coordinate agents: spawn workers with a prompt, message them, and manage swarm plans.",
+                  "Coordinate agents: spawn, message, and manage swarm tasks.",
+                  True,
+              ),
+
+              # agentgrep schema properties.
+              (
+                  "Mode: grep (default), find (file names), outline (one file), trace (relationship DSL).",
+                  "Mode: grep, find file names, outline one file, or trace relationships.",
+                  False,
+              ),
+              (
+                  "Search query. Required for grep (literal unless regex=true); optional ranking terms for find.",
+                  "Search text for grep (literal unless regex=true); ranking terms for find.",
+                  True,
+              ),
+              (
+                  "Single file to inspect. Required for outline.",
+                  "File to inspect; required for outline.",
+                  False,
+              ),
+              (
+                  "Trace DSL terms, e.g. [\"subject:auth_status\", \"relation:rendered\"]. Not for grep/find; use query.",
+                  "Trace DSL terms, e.g. [\"subject:auth_status\", \"relation:rendered\"]. For grep/find, use query.",
+                  True,
+              ),
+              (
+                  "In grep mode, treat query as a regex. Defaults to false (literal).",
+                  "Treat the grep query as regex; defaults to false (literal).",
+                  False,
+              ),
+              (
+                  "Directory or file to search, relative to the workspace. Omit to search the whole workspace.",
+                  "Workspace-relative search path; omit to search the entire workspace.",
+                  False,
+              ),
+              (
+                  "Optional file glob filter such as **/*.rs. Omit to search everything.",
+                  "File glob filter, e.g. **/*.rs; omit to search all files.",
+                  False,
+              ),
+              (
+                  "Optional ripgrep file type filter, such as rs, py, js, ts, or md.",
+                  "Optional file type filter, e.g. rs, py, js, ts, or md.",
+                  False,
+              ),
+              (
+                  "Maximum number of files to return for find/trace-style modes.",
+                  "Maximum files returned by find/trace modes.",
+                  False,
+              ),
+              (
+                  "Maximum number of matching regions to return.",
+                  "Maximum matching regions.",
+                  False,
+              ),
+              (
+                  "Return only matching paths instead of match excerpts where supported.",
+                  "Return paths only where supported.",
+                  False,
+              ),
+
+              # Browser schema.
+              (
+                  "Exact trusted actions Jev may pick by ID, scoped to the handoff tab. Sensitive ones need caller OK.",
+                  "Trusted actions Jev may select by ID in the handoff tab; sensitive actions require caller approval.",
+                  False,
+              ),
+
+              # Background-task schema.
+              (
+                  "When wait returns, include a recent output preview. Failed tasks include a preview by default.",
+                  "Include an output preview on wait; failed tasks include one by default.",
+                  False,
+              ),
+              (
+                  "For delivery/watch: also wake after N seconds without output/progress (min 30). For jobs that may hang.",
+                  "For delivery/watch, wake after N seconds without progress (minimum 30).",
+                  False,
+              ),
+
+              # Swarm schema.
+              (
+                  "Action. launch runs your todo list (one agent per lane). spawn starts one worker on a lane; spawn requires label and should include prompt. message sends to one agent (to_session) or a channel; only the coordinator may omit both to message everyone. list_models shows available models/routes.",
+                  "Action: launch runs todo lanes; spawn starts a worker and requires a label. message targets a session or channel; only the coordinator may omit both to broadcast. list_models lists models/routes.",
+                  True,
+              ),
+              (
+                  "Required for spawn: the worker's lane name (e.g. 'auth refactor'). Each spawned worker owns that lane in your todo list (created from the prompt if missing); its todo list is the lane and syncs only it.",
+                  "Required for spawn: nonblank lane label. The spawned worker owns that todo lane.",
+                  False,
+              ),
+              (
+                  "For launch/run_plan: detach as a background task (default true); false blocks until the plan resolves.",
+                  "For launch/run_plan, detach by default; false waits for completion.",
+                  False,
+              ),
+              (
+                  "Model for new workers, e.g. 'openai-api:gpt-5.6-luna'. 'inherit' uses yours. See list_models.",
+                  "Model for new workers. Use 'inherit' for the coordinator's model/route; see list_models.",
+                  False,
+              ),
+
+              # Todo schema. Preserve the evaluation distinctions.
+              (
+                  "Coverage of integration boundaries, edge cases, packaging, and likely failure modes.",
+                  "Coverage of integration boundaries, edge cases, packaging, and failure modes.",
+                  False,
+              ),
+              (
+                  "How completely each requirement and changed output maps to a concrete check and observed result.",
+                  "How fully each requirement/output maps to a concrete check and result.",
+                  False,
+              ),
+              (
+                  "What the user actually wants: underlying reason and desired end state. Omit later to retain.",
+                  "The user's underlying goal and desired end state. Omit later to retain.",
+                  False,
+              ),
+              (
+                  "Optional longer brief: files, acceptance criteria, context. Not shown on the card; given to a swarm worker that takes this task.",
+                  "Details for the worker: files, acceptance criteria, and context. Not shown on the card.",
+                  False,
+              ),
+              (
+                  "Optional phase (1, 2, 3...). Phase 2 starts after phase 1 is done. Inside a phase, lanes (todos sharing a lane) run in parallel. Omit when tasks must be sequential.",
+                  "Optional phase number. Phases run sequentially; lanes within a phase run in parallel.",
+                  False,
+              ),
+              (
+                  "Evidence for the reported iteration_maturity: attempts, observations, or a real budget limit.",
+                  "Evidence supporting iteration_maturity: attempts, observations, or a budget limit.",
+                  False,
+              ),
+              (
+                  "Requirement-to-check process: an explicit loop for each requirement of this goal.",
+                  "Verification loop covering each goal requirement.",
+                  False,
+              ),
+              (
+                  "How directly checks represent observable acceptance behavior. indirect = inspection or an internal proxy; synthetic = custom harnesses, stubs, mocks, copied sources, or synthetic fixtures; representative = real public interfaces but not the complete acceptance workflow; acceptance_blocked = the real acceptance workflow was attempted but an external constraint prevented a result; acceptance_aligned = the real project build, integration test, or end-user workflow passed. Substitute-only validation is never acceptance_aligned.",
+                  "Validation quality: indirect uses inspection/proxies; synthetic uses substitutes; representative uses real interfaces but not the full workflow; acceptance_blocked means an external constraint blocked the real workflow; acceptance_aligned requires the real build, integration test, or end-user workflow to pass. Substitute-only checks are never acceptance_aligned.",
+                  True,
+              ),
+          ]
+
+          # Prompt files are validated first. No files are changed if a check fails.
+          rust_root = repo / "crates"
+          tool_root = repo / "crates/jcode-app-core/src/tool"
+
+          if not tool_root.is_dir():
+              errors.append(f"Missing tool source directory: {tool_root}")
+
+          rust_files = sorted(rust_root.rglob("*.rs")) if rust_root.is_dir() else []
+          if not rust_files:
+              errors.append("No Rust source files found under jcode-src/crates.")
+
+          # Apply exact Rust string-literal replacements in memory.
+          working = {
+              path: path.read_text(encoding="utf-8")
+              for path in rust_files
+          }
+          change_counts = {}
+          warnings = []
+
+          for old, new, required in replacements:
+              old_literal = '"' + json.dumps(old, ensure_ascii=False)[1:-1] + '"'
+              new_literal = '"' + json.dumps(new, ensure_ascii=False)[1:-1] + '"'
+
+              count = 0
+              for path in rust_files:
+                  content = working[path]
+                  found = content.count(old_literal)
+                  if found:
+                      working[path] = content.replace(old_literal, new_literal)
+                      count += found
+
+              change_counts[old] = count
+
+              if count == 0:
+                  if required:
+                      errors.append(
+                          "Required description not found: " + old[:100]
+                      )
+                  else:
+                      warnings.append(old[:100])
+
+          if errors:
+              print("PATCH ABORTED. No files were written.", file=sys.stderr)
+              for err in errors:
+                  print("ERROR:", err, file=sys.stderr)
+              sys.exit(1)
+
+          # Commit the planned source edits only after validation succeeds.
+          for path, content in prompt_updates.items():
+              path.write_text(content, encoding="utf-8")
+
+          for path, content in working.items():
+              original = path.read_text(encoding="utf-8")
+              if content != original:
+                  path.write_text(content, encoding="utf-8")
+
+          print("\nPrompt changes:")
+          for path in prompt_updates:
+              print(f"  updated {path.relative_to(repo)}")
+
+          print("\nDescription replacements:")
+          total = 0
+          for old, new, required in replacements:
+              count = change_counts[old]
+              if count:
+                  print(f"  {count:3} replacement(s): {old[:88]}")
+                  total += count
+
+          print(f"\nTotal Rust string replacements: {total}")
+
+          if warnings:
+              print("\nOptional descriptions not found; left unchanged:")
+              for warning in warnings:
+                  print("  -", warning)
+
+          print("\nPrompt and tool-description patch validated successfully.")
+          PY
 
       - name: Build release binary
         run: |
