@@ -382,12 +382,12 @@ jobs:
                   False,
               ),
               (
-                  "Optional longer brief: files, acceptance criteria, context. Not shown on the card; given to a swarm worker that takes this task.",
+                  "Optional longer brief: files, acceptance criteria, context. Not shown on the card; given to a swarm worker that takes this todo.",
                   "Details for the worker: files, acceptance criteria, and context. Not shown on the card.",
                   False,
               ),
               (
-                  "Optional phase (1, 2, 3...). Phase 2 starts after phase 1 is done. Inside a phase, lanes (todos sharing a lane) run in parallel. Omit when tasks must be sequential.",
+                  "Optional phase (1, 2, 3...). Phase 2 starts after phase 1 is done. Inside a phase, lanes (todos sharing a lane) run in parallel. Omit when steps must happen in list order.",
                   "Optional phase number. Phases run sequentially; lanes within a phase run in parallel.",
                   False,
               ),
@@ -397,7 +397,7 @@ jobs:
                   False,
               ),
               (
-                  "Requirement-to-check process: an explicit loop for each requirement of this goal.",
+                  "Requirement-to-check process: an explicit observation or check for each requirement of this goal.",
                   "Verification loop covering each goal requirement.",
                   False,
               ),
