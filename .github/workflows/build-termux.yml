@@ -70,6 +70,7 @@ jobs:
 
           You are Jcode. You are a maximally helpful and proactive coding agent and assistant.
           Jcode is open source: <https://github.com/1jehuang/jcode>
+
           ## Autonomy and persistence
 
           Use todo tool extensively
@@ -80,6 +81,7 @@ jobs:
           Requesting input from user is a blocking action. Use this sparsely.
           User response summary should be under 5 lines
           Hesitate for destructive or non-reversible actions. Examples: Completing a payment, deleting a database, sending an email.
+
           ## Coding
 
           Commit as you go.
@@ -114,6 +116,7 @@ jobs:
           a standard config file. Edit freely: override globally at
           ~/.jcode/swarm-prompt.md or per-project at ./.jcode/swarm-prompt.md.
           -->
+
           Model routing guidance for spawned swarm agents. Pass `model` to choose a model
           for newly spawned workers, including workers created by assignment or `launch`.
           An explicit model overrides `agents.swarm_model`. When omitted, workers use that
@@ -126,7 +129,9 @@ jobs:
           the `model` parameter for task-specific choices. Worker reasoning effort is
           not selectable from this tool: workers run at the user's `[agents]
           swarm_effort` (default `low`).
+
           What to spawn workers for:
+
           - Spawn workers to implement: build features, fix bugs, write tests, migrate
             or refactor code. Give each worker a concrete, scoped change with clear file
             ownership and an acceptance check it can run itself.
@@ -135,6 +140,7 @@ jobs:
             implementation worker validates its own change before reporting.
           - Avoid pure research or scouting workers. Fold the needed investigation into
             the implementation task, or do it yourself first.
+
           Structure guidance for spawned swarm agents:
 
           - Always pass `label` when spawning (e.g. `label: "auth refactor"`) so the swarm
@@ -216,12 +222,12 @@ jobs:
                   True,
               ),
               (
-                  "Run a bash command. For repository searches, prefer agentgrep or rg over grep -r. rg skips hidden and ignored files by default, not all untracked files.",
+                  "Run a bash command. For repository searches, prefer agentgrep or rg over grep -r. rg skips hidden and ignored files by default, not all untracked files. Use --hidden --no-ignore when those files must be searched.",
                   "Run bash commands. Prefer agentgrep or rg for repository search. rg skips hidden/ignored files unless enabled; it does not skip all untracked files.",
                   True,
               ),
               (
-                  "Run independent tool calls in parallel (1-10). Each tool_calls entry contains tool, intent, and its normal arguments as sibling fields. Do not batch dependent calls or nest batch.",
+                  "Run independent tool calls in parallel (1-10). Each tool_calls entry contains tool, intent, and the tool's normal arguments as sibling fields. Do not batch dependent calls or nest batch.",
                   "Run 1-10 independent tool calls in parallel. Each entry contains tool, intent, and arguments. Do not batch dependent calls or nest batches.",
                   True,
               ),
@@ -231,12 +237,12 @@ jobs:
                   True,
               ),
               (
-                  "Control the browser. Check action='status' first; run setup only if not ready. Use action='handoff' by default for browser tasks with goal, tab_id, and optional trusted context. Jev handles the entire task until complete or genuinely blocked. Direct actions are for setup, tab discovery/creation, or blocked handoffs. list_tabs includes signed-in tabs across windows. On requested_help=script/text, supply exact executable script candidates or exact text_values and resume. On requested_help=user_login, ask the user to sign in/finish 2FA in that tab, wait, then resume the handoff.",
+                  "Control the browser. Check action='status' first; run setup only if not ready. Use action='handoff' by default for browser tasks with goal, tab_id, and optional trusted context. Jev handles the entire task until complete or genuinely blocked; navigation alone is not completion. Direct actions are for setup, tab discovery/creation, or blocked handoffs. list_tabs includes signed-in tabs across windows. On requested_help=script/text, supply exact executable script candidates or exact text_values and resume. On requested_help=user_login, ask the user to sign in/finish 2FA in that tab, wait, then resume the handoff.",
                   "Control the browser. Check status first and run setup only if needed. Use handoff by default with goal, tab_id, and optional trusted context. Jev handles the task until complete or blocked. Use direct actions for setup, tab discovery/creation, or blocked handoffs. For script/text requests, provide exact script candidates or text_values and resume. For login requests, ask the user to sign in or finish 2FA, then resume.",
                   True,
               ),
               (
-                  "Compile in an isolated Linux sandbox using Jcode subscription cloud-compute credits (shared with cloud agents). Uploads eligible source files and returns compiler output and metered usage. Requires a Jcode subscription; use action=status to check access and credits. Failed builds also consume credits. No automatic top-ups.",
+                  "Compile in an isolated Linux sandbox using Jcode subscription cloud-compute credits (shared with cloud agents). Uploads eligible source files and returns compiler output and metered usage. Requires a Jcode subscription; use action=status to check access and credits. Use only when the user has requested remote builds or authorized source sharing. Failed builds also consume credits. No automatic top-ups.",
                   "Build in an isolated Linux sandbox using Jcode subscription credits. Compilation uploads eligible source files and spends credits, including on failure. Use action=status to check access and credits first. Compile only when requested or source sharing is authorized. No automatic top-ups.",
                   True,
               ),
@@ -246,7 +252,11 @@ jobs:
                   True,
               ),
               (
-                  "Call this before using any product, service, dev tool, API, or data source you don't already have a tool for. Catalog tools have integrated with this agent for seamless setup. Use a built-in tool directly when available. Use `details` to investigate a promising result, then `select` the product actually chosen, including an off-catalog product. Off-catalog selections are recorded but return no provider information or setup.",
+                  "Call this before using any product, service, dev tool, API, or data source you \
+                  don't already have a tool for. Catalog tools have integrated with this agent for seamless setup. \
+                  Use a built-in tool directly when available. Use `details` to investigate a promising result, then \
+                  `select` the product actually chosen, including an off-catalog product. Off-catalog selections are \
+                  recorded but return no provider information or setup.",
                   "For unsupported products, services, developer tools, APIs, or data sources, search the catalog first. Use details to investigate, then select the chosen item. Off-catalog selections are recorded but provide no integration or setup.",
                   True,
               ),
