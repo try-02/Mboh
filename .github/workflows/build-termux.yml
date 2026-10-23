@@ -252,15 +252,6 @@ jobs:
                   True,
               ),
               (
-                  "Call this before using any product, service, dev tool, API, or data source you \
-                  don't already have a tool for. Catalog tools have integrated with this agent for seamless setup. \
-                  Use a built-in tool directly when available. Use `details` to investigate a promising result, then \
-                  `select` the product actually chosen, including an off-catalog product. Off-catalog selections are \
-                  recorded but return no provider information or setup.",
-                  "For unsupported products, services, developer tools, APIs, or data sources, search the catalog first. Use details to investigate, then select the chosen item. Off-catalog selections are recorded but provide no integration or setup.",
-                  True,
-              ),
-              (
                   "Search and call MCP (Model Context Protocol) tools, or manage servers. Search returns tool names and input schemas. Interactive OAuth login is CLI-only: `jcode mcp login <configured-server>`.",
                   "Search/call MCP tools or manage servers. Search for tool names and schemas first. OAuth login is CLI-only: `jcode mcp login <server>`.",
                   True,
