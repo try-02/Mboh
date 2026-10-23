@@ -1,0 +1,130 @@
+name: Build optimized JCode for Termux ARM64
+
+on:
+  workflow_dispatch:
+    inputs:
+      jcode_ref:
+        description: 'JCode commit to patch (keep the default for v0.99.1)'
+        required: true
+        default: '7206efd0c'
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    # Native ARM64 runner avoids cross-linker surprises. Supported by GitHub Actions.
+    runs-on: ubuntu-22.04-arm
+    timeout-minutes: 120
+    env:
+      JCODE_REF: ${{ inputs.jcode_ref }}
+    steps:
+      - name: Checkout optimizer files
+        uses: actions/checkout@v4
+
+      - name: Verify native ARM64 runner
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = "aarch64"
+          rustc -vV 2>/dev/null | grep -q 'host: aarch64-unknown-linux-gnu' || true
+          uname -a
+
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential clang cmake perl pkg-config patchelf libasound2-dev
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Fetch pinned JCode source
+        run: |
+          set -euo pipefail
+          git clone --filter=blob:none https://github.com/1jehuang/jcode.git jcode-src
+          git -C jcode-src checkout --detach "$JCODE_REF"
+          echo "JCODE_SOURCE_COMMIT=$(git -C jcode-src rev-parse HEAD)" >> "$GITHUB_ENV"
+          echo "JCODE_SOURCE_SHORT=$(git -C jcode-src rev-parse --short HEAD)" >> "$GITHUB_ENV"
+          echo "Source commit: $(git -C jcode-src rev-parse HEAD)"
+
+      - name: Apply Token Optimizer patch
+        run: python3 ./install.py ./jcode-src
+
+      - name: Build release binary
+        run: |
+          set -euo pipefail
+          cargo build --locked --release --manifest-path jcode-src/Cargo.toml --bin jcode
+          test -x jcode-src/target/release/jcode
+          jcode-src/target/release/jcode --version
+
+      - name: Package binary and runtime libraries
+        run: |
+          set -euo pipefail
+          rm -rf dist
+          mkdir -p dist/lib
+          cp jcode-src/target/release/jcode dist/jcode
+          chmod 755 dist/jcode
+          strip --strip-unneeded dist/jcode || true
+          ldd dist/jcode | tee dist/ldd-build-runner.txt
+          if grep -q 'not found' dist/ldd-build-runner.txt; then
+            echo 'A shared library dependency is missing on the build runner.' >&2
+            exit 1
+          fi
+
+          python3 - dist/jcode dist/lib <<'PY'
+          import os
+          import re
+          import shutil
+          import subprocess
+          import sys
+
+          binary, lib_dir = sys.argv[1:]
+          os.makedirs(lib_dir, exist_ok=True)
+          result = subprocess.run(["ldd", binary], check=True, text=True,
+                                  stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+          core_glibc = re.compile(
+              r"^(?:libc\.so\.6|libm\.so\.6|libdl\.so\.2|libpthread\.so\.0|"
+              r"librt\.so\.1|libresolv\.so\.2|libutil\.so\.1|libanl\.so\.1|"
+              r"ld-linux-aarch64\.so\.[0-9]+|linux-vdso\.so\.[0-9]+)$"
+          )
+          copied = set()
+          for line in result.stdout.splitlines():
+              match = re.search(r"=>\s+(/[^\s]+)", line)
+              if not match:
+                  match = re.match(r"\s*(/[^\s]+)", line)
+              if not match:
+                  continue
+              path = match.group(1)
+              name = os.path.basename(path)
+              if core_glibc.match(name) or name in copied or not os.path.isfile(path):
+                  continue
+              shutil.copy2(path, os.path.join(lib_dir, name))
+              copied.add(name)
+          print("Bundled non-core runtime libraries:", ", ".join(sorted(copied)) or "none")
+          PY
+
+          cp scripts/install-termux.sh dist/install-termux.sh
+          cp scripts/rollback-termux.sh dist/rollback-termux.sh
+          chmod 755 dist/install-termux.sh dist/rollback-termux.sh
+          {
+            echo "JCode source commit: $JCODE_SOURCE_COMMIT"
+            echo "JCode short commit: $JCODE_SOURCE_SHORT"
+            echo "JCode version: $(jcode-src/target/release/jcode --version 2>&1 | head -1)"
+            echo "Rust: $(rustc --version)"
+            echo "Build runner: $(uname -m) / $(lsb_release -ds 2>/dev/null || true)"
+            echo "Target: aarch64-unknown-linux-gnu"
+            echo "Optimizer: source patch applied; enable at runtime with JCODE_TOKEN_OPTIMIZER=1"
+          } > dist/BUILD-INFO.txt
+          (cd dist && sha256sum jcode > SHA256SUMS)
+          tar -czf jcode-token-optimizer-termux-aarch64.tar.gz -C dist .
+          sha256sum jcode-token-optimizer-termux-aarch64.tar.gz
+          ls -lh jcode-token-optimizer-termux-aarch64.tar.gz
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: jcode-token-optimizer-termux-aarch64
+          path: jcode-token-optimizer-termux-aarch64.tar.gz
+          if-no-files-found: error
+          retention-days: 14
