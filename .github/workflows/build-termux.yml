@@ -255,7 +255,7 @@ jobs:
               ),
               (
                   "Wake on completion.",
-                  "Wake agent when finished."
+                  "Wake agent when finished.",
                   True,
               ),
               (
