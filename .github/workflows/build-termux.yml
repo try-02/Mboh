@@ -48,6 +48,10 @@ jobs:
           echo "JCODE_SOURCE_SHORT=$(git -C jcode-src rev-parse --short HEAD)" >> "$GITHUB_ENV"
           echo "Source commit: $(git -C jcode-src rev-parse HEAD)"
 
+      - name: Copy
+        run: |
+          cp lib.rs jcode-src/crates/jcode-message-types/src/
+
       - name: Compact system prompt and tool descriptions
         run: |
           python3 - <<'PY'
