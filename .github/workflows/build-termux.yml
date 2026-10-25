@@ -202,8 +202,8 @@ jobs:
           replacements = [
               # Common properties shared by many tools.
               (
-                  "Required short label shown in the UI: why this call is being made.",
-                  "Short reason for this action.",
+                  "Required short label shown in the UI: why this call is being made.";
+                  "Short reason for this action.";
                   True,
               ),
               (
