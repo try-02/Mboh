@@ -224,7 +224,7 @@ jobs:
               ),
               (
                   "Apply a multi-file patch (Codex *** Begin Patch or unified diff).",
-                  "Apply a unified diff or patch across files.",
+                  "Apply patch: contents must match byte-for-byte (whitespace and newline sensitive).",
                   True,
               ),
               (
