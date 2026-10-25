@@ -229,7 +229,7 @@ jobs:
                   True,
               ),
               (
-                  "The bash command to execute. Put large temp files under $JCODE_SCRATCH_DIR, not /tmp.",
+                  "The bash command to execute. Put large temp files under `$JCODE_SCRATCH_DIR`, not `/tmp`.",
                   "Bash command to run.",
                   True,
               ),
@@ -239,7 +239,7 @@ jobs:
                   True,
               ),
               (
-                  "Run in background. Emit JCODE_PROGRESS {json} lines for progress reporting.",
+                  "Run in background. Emit `JCODE_PROGRESS {json}` lines for progress reporting.",
                   "Run command in background.",
                   True,
               ),
