@@ -97,18 +97,20 @@ jobs:
           Don't do anything that the user would regret."""
 
           NEW_SYSTEM = """## Identity
+          You are Jcode, a proactive coding agent.
 
-          You are Jcode, a proactive coding agent and assistant.
-          Source: <https://github.com/1jehuang/jcode>
+          ## Tools & Coding
+          - Available tools: `bash`, `read`, `write`, `edit`, `apply_patch`, and skills (`/skillname`).
+          - Modify files only with `edit`, `apply_patch`, or `write` (never sed, perl, or Python inline scripts in bash).
+          - Run only non-interactive commands in `bash`.
+          - Commit git changes progressively.
 
-          ## Autonomy
-          Work autonomously toward the user's goal. Fix problems instead of only reporting them. Use todos for multi-step work, be comprehensive, and ask only when blocked. Pause before destructive or irreversible actions. Keep final summaries under five lines.
-
-          ## Coding
-          Commit incrementally. Prefer swarm over branches/worktrees unless isolation is needed. Use non-interactive commands. Edit with `edit`, `replace`, `apply_patch`, or `write`, not `sed`, `perl`, or Python scripts in Bash.
-
-          ## Don't
-          Avoid em dashes and semicolons used as dashes. Do not deny academic help, reset passwords, or take actions likely to cause regret."""
+          ## Autonomy & Style
+          - Be autonomous: resolve problems directly and fulfill user intent without unnecessary blockers.
+          - Confirm before destructive actions (deleting data, overwriting critical files).
+          - Keep response summaries under 5 lines.
+          - Never use em dashes (—) or semicolons in place of em dashes.
+          - Support academic tasks. Never attempt password resets."""
 
           OLD_SWARM = """<!--
           This file IS the swarm config. Swarms are complicated, dynamic systems, so
@@ -201,12 +203,12 @@ jobs:
               # Common properties shared by many tools.
               (
                   "Required short label shown in the UI: why this call is being made.",
-                  "Why this call is being made; shown in the UI.",
+                  "Short reason for this action.",
                   True,
               ),
               (
                   "Re-run accepting the stated token cost of a withheld result.",
-                  "Confirm the stated token cost and rerun.",
+                  "Force return withheld large output.",
                   True,
               ),
 
@@ -218,12 +220,82 @@ jobs:
               ),
               (
                   "Apply a multi-file patch (Codex *** Begin Patch or unified diff).",
-                  "Apply a multi-file Codex patch or unified diff.",
+                  "Apply a unified diff or patch across files.",
                   True,
               ),
               (
                   "Run a bash command. For repository searches, prefer agentgrep or rg over grep -r. rg skips hidden and ignored files by default, not all untracked files. Use --hidden --no-ignore when those files must be searched.",
-                  "Run bash commands. Prefer agentgrep or rg for repository search. rg skips hidden/ignored files unless enabled; it does not skip all untracked files.",
+                  "Execute a non-interactive bash command.",
+                  True,
+              ),
+              (
+                  "The bash command to execute. Put large temp files under $JCODE_SCRATCH_DIR, not /tmp.",
+                  "Bash command to run.",
+                  True,
+              ),
+              (
+                  "Timeout in MILLISECONDS (not seconds), e.g. 600000 = 10min; kills with exit 124. Omit for no timeout.",
+                  "Timeout in milliseconds (e.g. 10000 = 10s).",
+                  True,
+              ),
+              (
+                  "Run in background. Emit JCODE_PROGRESS {json} lines for progress reporting.",
+                  "Run command in background.",
+                  True,
+              ),
+              (
+                  "With run_in_background: wake after N seconds without output/progress (min 30). For jobs that may hang.",
+                  "Wake after N seconds without output (min 30).",
+                  True,
+              ),
+              (
+                  "Notify on completion.",
+                  "Notify when done.",
+                  True,
+              ),
+              (
+                  "Wake on completion.",
+                  Wake agent when finished."
+                  True,
+              ),
+              (
+                  "Only when re-issuing a command the destructive gate refused; explain which user request it serves.",
+                  "Reason why a blocked destructive command is safe.",
+                  True,
+              ),
+              (
+                  "Read a file. Supports text files, image files, and PDFs.",
+                  "Read file content.",
+                  True,
+              ),
+              (
+                  "1-based start line for text files.",
+                  "Line number to start reading from (1-based).",
+                  True,
+              ),
+              (
+                  "Max text lines to read. Default 5000.",
+                  "Maximum lines to read.",
+                  True,
+              ),
+              (
+                  "Single-edit shorthand: exact text to replace. Omit when using edits.",
+                  "Exact existing text to match.",
+                  True,
+              ),
+              (
+                  "Single-edit shorthand: replacement text.",
+                  "New text to replace old_string.",
+                  True,
+              ),
+              (
+                  "Single-edit shorthand: replace every match.",
+                  "Replace all occurrences if true.",
+                  True,
+              ),
+              (
+                  "Replacements applied in order. Each old_string must match exactly once unless replace_all is set.",
+                  "List of exact replacements to apply in order.",
                   True,
               ),
               (
@@ -248,7 +320,7 @@ jobs:
               ),
               (
                   "Edit a file by exact replacement. All edits apply or none do.",
-                  "Edit files by exact replacement. All edits apply atomically or not at all.",
+                  "Edit file by exact text search-and-replace.",
                   True,
               ),
               (
@@ -410,7 +482,7 @@ jobs:
 
           # Prompt files are validated first. No files are changed if a check fails.
           rust_root = repo / "crates"
-          tool_root = repo / "crates/jcode-app-core/src/tool"
+          tool_root = repo / "crates"
 
           if not tool_root.is_dir():
               errors.append(f"Missing tool source directory: {tool_root}")
