@@ -23,7 +23,6 @@ jobs:
           pkg upgrade -y
           pkg install -y python rust clang make pkg-config maturin curl coreutils tar
 
-          # Pasang typing-extensions agar smoke-test pydantic-core tidak error
           python -m pip install --upgrade setuptools wheel typing-extensions
           export ANDROID_API_LEVEL=24
           export CARGO_BUILD_JOBS=2
@@ -47,13 +46,13 @@ jobs:
           curl -fL --retry 3 "$URL" -o "$SDIST"
           printf "%s  %s\n" "$EXPECTED_SHA256" "$SDIST" | sha256sum -c -
 
-          # Ekstrak source code pydantic-core
+          # Ekstrak tarball pydantic-core
           SRC_DIR="$PREFIX/tmp/pydantic_core_src"
           mkdir -p "$SRC_DIR"
           tar -xzf "$SDIST" -C "$SRC_DIR" --strip-components=1
           cd "$SRC_DIR"
 
-          # Build wheel menggunakan maturin CLI secara langsung
+          # Build .whl langsung dengan maturin CLI
           maturin build \
             --release \
             --strip \
@@ -70,8 +69,6 @@ jobs:
           case "$BUILT" in
               *-cp314-cp314-android_24_arm64_v8a.whl) ;;
               *)
-                  # Package-scoped retag: this wheel was built in Termux/Bionic,
-                  # not on the host Ubuntu runner.
                   wheel tags \
                     --python-tag=cp314 \
                     --abi-tag=cp314 \
