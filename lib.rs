@@ -351,13 +351,21 @@ impl Message {
         }
     }
 
+    // Helper untuk mendeteksi HANYA Session Context (OS, memori, git, hardware)
+    pub fn is_session_context(&self) -> bool {
+        self.content.iter().any(|block| match block {
+            ContentBlock::Text { text, .. } => text.contains("# Session Context"),
+            _ => false,
+        })
+    }
+
     /// Return a copy of messages with timestamps injected into user-role text content.
     /// Tool results get a stable UTC timing header prepended to content.
     /// User text messages get a stable UTC timestamp prepended to the first text block.
     pub fn with_timestamps(messages: &[Message]) -> Vec<Message> {
         messages
             .iter()
-            .filter(|msg| !msg.is_internal_system_reminder()) // <-- BUANG SEMUA SYSTEM-REMINDER
+            .filter(|msg| !msg.is_session_context()) // <-- BUANG SEMUA SYSTEM-REMINDER
             .cloned()
             .collect()
     }
@@ -541,7 +549,18 @@ pub fn messages_with_dynamic_system_context(
     messages: &[Message],
     system_dynamic: &str,
 ) -> Vec<Message> {
-    messages.to_vec()
+    let Some(dynamic_message) = dynamic_system_context_message(system_dynamic) else {
+        return messages.to_vec();
+    };
+
+    let mut out = messages.to_vec();
+    let insert_at = out
+        .iter()
+        .rposition(is_fresh_user_text_message)
+        .map(|idx| idx + 1)
+        .unwrap_or(out.len());
+    out.insert(insert_at, dynamic_message);
+    out
 }
 
 /// Sanitize a tool ID so it matches the pattern `^[a-zA-Z0-9_-]+$`.
