@@ -1,0 +1,116 @@
+name: Build httptools wheel for Termux
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-httptools:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 90
+    steps:
+      - name: Prepare artifact directory and builder script
+        shell: bash
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/wheelhouse"
+          chmod 0777 "$GITHUB_WORKSPACE/wheelhouse"
+          cat > "$RUNNER_TEMP/build-httptools.sh" <<'SCRIPT'
+          set -eu
+
+          pkg update
+          pkg upgrade -y
+          # httptools membutuhkan C compiler (clang) dan make, tidak butuh rust/maturin
+          pkg install -y python clang make pkg-config curl coreutils tar
+
+          python -m pip install --upgrade setuptools wheel cython packaging
+          export ANDROID_API_LEVEL=24
+
+          python - <<'PY'
+          import sys
+          import sysconfig
+          from packaging.tags import sys_tags
+          print("Python:", sys.version)
+          print("Platform:", sysconfig.get_platform())
+          if sys.version_info[:2] != (3, 14):
+              raise SystemExit("Expected CPython 3.14 in the Termux build container")
+          if not any(str(tag) == "cp314-cp314-android_24_arm64_v8a" for tag in sys_tags()):
+              raise SystemExit("The build interpreter does not accept the target Android wheel tag")
+          PY
+
+          SDIST="$PREFIX/tmp/httptools-0.8.0.tar.gz"
+          URL="https://files.pythonhosted.org/packages/43/e5/d471fcb0e14523fe1c3f4ba58ca52480e7bd70ad7109a3846bc75892f7fb/httptools-0.8.0.tar.gz"
+          EXPECTED_SHA256="6b2a32f18d97e16e90827d7a819ffa8dbd8cc245fc4e1fa9d1095b54ef4bd999"
+
+          curl -fL --retry 3 "$URL" -o "$SDIST"
+          printf "%s  %s\n" "$EXPECTED_SHA256" "$SDIST" | sha256sum -c -
+
+          # Build wheel menggunakan pip (setuptools & cython sudah ada di site-packages)
+          python -m pip wheel \
+            --no-deps \
+            --no-build-isolation \
+            --wheel-dir=/out \
+            "$SDIST"
+
+          BUILT="$(find /out -maxdepth 1 -type f -name "httptools-0.8.0-*.whl" -print -quit)"
+          if [ -z "$BUILT" ]; then
+              echo "ERROR: httptools wheel was not produced" >&2
+              ls -la /out
+              exit 1
+          fi
+
+          case "$BUILT" in
+              *-cp314-cp314-android_24_arm64_v8a.whl) ;;
+              *)
+                  wheel tags \
+                    --python-tag=cp314 \
+                    --abi-tag=cp314 \
+                    --platform-tag=android_24_arm64_v8a \
+                    --remove "$BUILT"
+                  ;;
+          esac
+
+          FINAL_WHEEL="$(find /out -maxdepth 1 -type f -name "httptools-0.8.0-cp314-cp314-android_24_arm64_v8a.whl" -print -quit)"
+          if [ -z "$FINAL_WHEEL" ]; then
+              echo "ERROR: expected Android wheel tag was not produced" >&2
+              ls -la /out
+              exit 1
+          fi
+
+          python -m pip install --no-deps --force-reinstall "$FINAL_WHEEL"
+          python - <<'PY'
+          import sys
+          import sysconfig
+          import httptools
+
+          parser = httptools.HttpRequestParser(None)
+          url = httptools.parse_url(b"http://example.com/test?a=1")
+          assert url.path == b"/test"
+          print("httptools import and parse_url: OK")
+          print("Python:", sys.version.split()[0])
+          print("Platform:", sysconfig.get_platform())
+          PY
+
+          cd /out
+          sha256sum "$(basename "$FINAL_WHEEL")" > SHA256SUMS
+          ls -lh /out
+          SCRIPT
+          chmod 0755 "$RUNNER_TEMP/build-httptools.sh"
+
+      - name: Build and smoke-test in Termux userspace
+        shell: bash
+        run: |
+          docker run --rm \
+            --volume "$GITHUB_WORKSPACE/wheelhouse:/out" \
+            --volume "$RUNNER_TEMP/build-httptools.sh:/tmp/build-httptools.sh:ro" \
+            termux/termux-docker@sha256:3a0a340fca9947f7139a0d695f1234edf0172daed6a2f1e0b1413ef91453c9ce \
+            bash /tmp/build-httptools.sh
+
+      - name: Upload wheel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: httptools-0.8.0-cp314-android_24_arm64_v8a
+          path: wheelhouse/*
+          if-no-files-found: error
+          retention-days: 14
