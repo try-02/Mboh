@@ -1,0 +1,115 @@
+name: Build pydantic-core wheel for Termux
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-pydantic-core:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 90
+    steps:
+      - name: Prepare artifact directory and builder script
+        shell: bash
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/wheelhouse"
+          chmod 0777 "$GITHUB_WORKSPACE/wheelhouse"
+          cat > "$RUNNER_TEMP/build-pydantic-core.sh" <<'SCRIPT'
+          set -eu
+
+          pkg update
+          pkg upgrade -y
+          pkg install -y python rust clang make pkg-config maturin curl coreutils
+
+          python -m pip install --upgrade setuptools wheel
+          export ANDROID_API_LEVEL=24
+          export CARGO_BUILD_JOBS=2
+
+          python - <<'PY'
+          import sys
+          import sysconfig
+          from packaging.tags import sys_tags
+          print("Python:", sys.version)
+          print("Platform:", sysconfig.get_platform())
+          if sys.version_info[:2] != (3, 14):
+              raise SystemExit("Expected CPython 3.14 in the Termux build container")
+          if not any(str(tag) == "cp314-cp314-android_24_arm64_v8a" for tag in sys_tags()):
+              raise SystemExit("The build interpreter does not accept the target Android wheel tag")
+          PY
+
+          SDIST="$PREFIX/tmp/pydantic_core-2.50.1.tar.gz"
+          URL="https://files.pythonhosted.org/packages/a6/24/af4ec4be49fbc810f35b0bdcacc3d433b56bbfa469fd3bfd4ae116cd9bf1/pydantic_core-2.50.1.tar.gz"
+          EXPECTED_SHA256="e50d7b94baac6c7d09927fa5ca5800a0c7ee5015c7fcff65beb3a1931b5a6e09"
+
+          curl -fL --retry 3 "$URL" -o "$SDIST"
+          printf "%s  %s\\n" "$EXPECTED_SHA256" "$SDIST" | sha256sum -c -
+
+          python -m pip wheel \
+            --no-deps \
+            --no-build-isolation \
+            --wheel-dir=/out \
+            "$SDIST"
+
+          BUILT="$(find /out -maxdepth 1 -type f -name "pydantic_core-2.50.1-*.whl" -print -quit)"
+          if [ -z "$BUILT" ]; then
+              echo "ERROR: pydantic-core wheel was not produced" >&2
+              ls -la /out
+              exit 1
+          fi
+
+          case "$BUILT" in
+              *-cp314-cp314-android_24_arm64_v8a.whl) ;;
+              *)
+                  # Package-scoped retag: this wheel was built in Termux/Bionic,
+                  # not on the host Ubuntu runner.
+                  wheel tags \
+                    --python-tag=cp314 \
+                    --abi-tag=cp314 \
+                    --platform-tag=android_24_arm64_v8a \
+                    --remove "$BUILT"
+                  ;;
+          esac
+
+          FINAL_WHEEL="$(find /out -maxdepth 1 -type f -name "pydantic_core-2.50.1-cp314-cp314-android_24_arm64_v8a.whl" -print -quit)"
+          if [ -z "$FINAL_WHEEL" ]; then
+              echo "ERROR: expected Android wheel tag was not produced" >&2
+              ls -la /out
+              exit 1
+          fi
+
+          python -m pip install --no-deps --force-reinstall "$FINAL_WHEEL"
+          python - <<'PY'
+          import sys
+          import sysconfig
+          from pydantic_core import SchemaValidator, core_schema
+          validator = SchemaValidator(core_schema.int_schema())
+          assert validator.validate_python("42") == 42
+          print("pydantic-core import and validation: OK")
+          print("Python:", sys.version.split()[0])
+          print("Platform:", sysconfig.get_platform())
+          PY
+
+          cd /out
+          sha256sum "$(basename "$FINAL_WHEEL")" > SHA256SUMS
+          ls -lh /out
+          SCRIPT
+          chmod 0755 "$RUNNER_TEMP/build-pydantic-core.sh"
+
+      - name: Build and smoke-test in Termux userspace
+        shell: bash
+        run: |
+          docker run --rm \
+            --volume "$GITHUB_WORKSPACE/wheelhouse:/out" \
+            --volume "$RUNNER_TEMP/build-pydantic-core.sh:/tmp/build-pydantic-core.sh:ro" \
+            termux/termux-docker@sha256:3a0a340fca9947f7139a0d695f1234edf0172daed6a2f1e0b1413ef91453c9ce \
+            bash /tmp/build-pydantic-core.sh
+
+      - name: Upload wheel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pydantic-core-2.50.1-cp314-android_24_arm64_v8a
+          path: wheelhouse/*
+          if-no-files-found: error
+          retention-days: 14
