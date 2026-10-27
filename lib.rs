@@ -355,9 +355,12 @@ impl Message {
     /// Tool results get a stable UTC timing header prepended to content.
     /// User text messages get a stable UTC timestamp prepended to the first text block.
     pub fn with_timestamps(messages: &[Message]) -> Vec<Message> {
-        messages.to_vec()
+        messages
+            .iter()
+            .filter(|msg| !msg.is_internal_system_reminder()) // <-- BUANG SEMUA SYSTEM-REMINDER
+            .cloned()
+            .collect()
     }
-}
 
 pub const TOOL_OUTPUT_MISSING_TEXT: &str =
     "Tool output missing (session interrupted before tool execution completed)";
