@@ -23,7 +23,6 @@ jobs:
           pkg upgrade -y
           pkg install -y python rust clang make pkg-config maturin curl coreutils tar
 
-          # anyio dipasang agar impor modul watchfiles saat smoke-test tidak gagal
           python -m pip install --upgrade setuptools wheel anyio packaging
           export ANDROID_API_LEVEL=24
           export CARGO_BUILD_JOBS=2
@@ -52,12 +51,16 @@ jobs:
           tar -xzf "$SDIST" -C "$SRC_DIR" --strip-components=1
           cd "$SRC_DIR"
 
-          # watchfiles dibuat dengan Rust & maturin
           maturin build \
             --release \
             --strip \
             --out /out \
             --interpreter python
+
+          # PENTING: Pindah keluar dari folder source dan bersihkan
+          # agar Python tidak mengimpor file lokal ./watchfiles
+          cd /out
+          rm -rf "$SRC_DIR"
 
           BUILT="$(find /out -maxdepth 1 -type f -name "watchfiles-1.3.0-*.whl" -print -quit)"
           if [ -z "$BUILT" ]; then
@@ -98,7 +101,6 @@ jobs:
           print("Platform:", sysconfig.get_platform())
           PY
 
-          cd /out
           sha256sum "$(basename "$FINAL_WHEEL")" > SHA256SUMS
           ls -lh /out
           SCRIPT
