@@ -361,6 +361,7 @@ impl Message {
             .cloned()
             .collect()
     }
+}
 
 pub const TOOL_OUTPUT_MISSING_TEXT: &str =
     "Tool output missing (session interrupted before tool execution completed)";
