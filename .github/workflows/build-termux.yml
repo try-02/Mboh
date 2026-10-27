@@ -15,7 +15,7 @@ permissions:
 jobs:
   build:
     # Native ARM64 runner avoids cross-linker surprises. Supported by GitHub Actions.
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04-arm
     timeout-minutes: 120
     env:
       JCODE_REF: ${{ inputs.jcode_ref }}
