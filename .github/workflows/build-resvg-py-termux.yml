@@ -1,0 +1,142 @@
+name: Build resvg-py wheel for Termux
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-resvg-py:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 90
+    steps:
+      - name: Prepare artifact directory and builder script
+        shell: bash
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/wheelhouse"
+          chmod 0777 "$GITHUB_WORKSPACE/wheelhouse"
+          cat > "$RUNNER_TEMP/build-resvg-py.sh" <<'SCRIPT'
+          set -eu
+
+          pkg update
+          pkg upgrade -y
+          pkg install -y python rust clang make pkg-config maturin curl coreutils tar patchelf
+
+          python -m pip install --upgrade setuptools wheel packaging
+          export ANDROID_API_LEVEL=24
+          export CARGO_BUILD_JOBS=2
+
+          # Memaksa linker menautkan libpython3.14.so pada modul abi3 di Android
+          export RUSTFLAGS="-C link-arg=-L$PREFIX/lib -C link-arg=-Wl,--no-as-needed -C link-arg=-lpython3.14"
+
+          python - <<'PY'
+          import sys
+          import sysconfig
+          from packaging.tags import sys_tags
+          print("Python:", sys.version)
+          print("Platform:", sysconfig.get_platform())
+          if sys.version_info[:2] != (3, 14):
+              raise SystemExit("Expected CPython 3.14 in the Termux build container")
+          if not any(str(tag) == "cp314-cp314-android_24_arm64_v8a" for tag in sys_tags()):
+              raise SystemExit("The build interpreter does not accept the target Android wheel tag")
+          PY
+
+          SDIST="$PREFIX/tmp/resvg_py-0.5.0.tar.gz"
+          URL="https://files.pythonhosted.org/packages/2a/64/a24f8f29d8bf158e01f6ccad68a1366afd922dc0f0977cbd0c0aaa7a22f2/resvg_py-0.5.0.tar.gz"
+          EXPECTED_SHA256="6d3bf8e866b4e129524d9432a809138b2d100931d8d635bc81294002abcdfd46"
+
+          curl -fL --retry 3 "$URL" -o "$SDIST"
+          printf "%s  %s\n" "$EXPECTED_SHA256" "$SDIST" | sha256sum -c -
+
+          SRC_DIR="$PREFIX/tmp/resvg_py_src"
+          mkdir -p "$SRC_DIR"
+          tar -xzf "$SDIST" -C "$SRC_DIR" --strip-components=1
+          cd "$SRC_DIR"
+
+          maturin build \
+            --release \
+            --strip \
+            --out /out \
+            --interpreter python
+
+          # Pindah keluar dan bersihkan source tree agar tidak konflik saat import lokal
+          cd /out
+          rm -rf "$SRC_DIR"
+
+          BUILT="$(find /out -maxdepth 1 -type f -name "resvg_py-0.5.0-*.whl" -print -quit)"
+          if [ -z "$BUILT" ]; then
+              echo "ERROR: resvg-py wheel was not produced" >&2
+              ls -la /out
+              exit 1
+          fi
+
+          case "$BUILT" in
+              *-cp314-cp314-android_24_arm64_v8a.whl) ;;
+              *)
+                  wheel tags \
+                    --python-tag=cp314 \
+                    --abi-tag=cp314 \
+                    --platform-tag=android_24_arm64_v8a \
+                    --remove "$BUILT"
+                  ;;
+          esac
+
+          FINAL_WHEEL="$(find /out -maxdepth 1 -type f -name "resvg_py-0.5.0-cp314-cp314-android_24_arm64_v8a.whl" -print -quit)"
+          if [ -z "$FINAL_WHEEL" ]; then
+              echo "ERROR: expected Android wheel tag was not produced" >&2
+              ls -la /out
+              exit 1
+          fi
+
+          # Gunakan $PREFIX/tmp untuk inject DT_NEEDED libpython3.14.so
+          PATCH_DIR="$PREFIX/tmp/wheel_patch"
+          rm -rf "$PATCH_DIR"
+          mkdir -p "$PATCH_DIR"
+          wheel unpack "$FINAL_WHEEL" -d "$PATCH_DIR"
+          UNPACKED_DIR="$(find "$PATCH_DIR" -mindepth 1 -maxdepth 1 -type d)"
+          find "$UNPACKED_DIR" -type f -name "*.so" -exec patchelf --add-needed libpython3.14.so {} +
+          rm -f "$FINAL_WHEEL"
+          wheel pack "$UNPACKED_DIR" -d /out
+          rm -rf "$PATCH_DIR"
+
+          FINAL_WHEEL="$(find /out -maxdepth 1 -type f -name "resvg_py-0.5.0-cp314-cp314-android_24_arm64_v8a.whl" -print -quit)"
+
+          python -m pip install --no-deps --force-reinstall "$FINAL_WHEEL"
+          python - <<'PY'
+          import sys
+          import sysconfig
+          import resvg_py
+
+          # Smoke-test: render string SVG sederhana ke buffer bytes PNG
+          svg_code = '<svg width="100" height="100"><circle cx="50" cy="50" r="40" fill="red" /></svg>'
+          png_bytes = resvg_py.svg_to_bytes(svg_string=svg_code)
+          assert png_bytes.startswith(b"\x89PNG"), "Hasil render bukan file PNG yang valid"
+          print("resvg_py import and SVG-to-PNG render: OK")
+          print("Rendered PNG byte size:", len(png_bytes))
+          print("Python:", sys.version.split()[0])
+          print("Platform:", sysconfig.get_platform())
+          PY
+
+          cd /out
+          sha256sum "$(basename "$FINAL_WHEEL")" > SHA256SUMS
+          ls -lh /out
+          SCRIPT
+          chmod 0755 "$RUNNER_TEMP/build-resvg-py.sh"
+
+      - name: Build and smoke-test in Termux userspace
+        shell: bash
+        run: |
+          docker run --rm \
+            --volume "$GITHUB_WORKSPACE/wheelhouse:/out" \
+            --volume "$RUNNER_TEMP/build-resvg-py.sh:/tmp/build-resvg-py.sh:ro" \
+            termux/termux-docker@sha256:3a0a340fca9947f7139a0d695f1234edf0172daed6a2f1e0b1413ef91453c9ce \
+            bash /tmp/build-resvg-py.sh
+
+      - name: Upload wheel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: resvg-py-0.5.0-cp314-android_24_arm64_v8a
+          path: wheelhouse/*
+          if-no-files-found: error
+          retention-days: 14
