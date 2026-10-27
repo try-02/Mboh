@@ -63,6 +63,11 @@ jobs:
             --wheel-dir=/out \
             .
 
+          # PENTING: Pindah keluar dari SRC_DIR dan bersihkan source tree
+          # agar Python tidak mengimpor ./psutil lokal saat smoke-test
+          cd /out
+          rm -rf "$SRC_DIR"
+
           BUILT="$(find /out -maxdepth 1 -type f -name 'psutil-8.0.0-*.whl' -print -quit)"
           if [ -z "$BUILT" ]; then
               echo "ERROR: psutil 8.0.0 wheel was not produced" >&2
@@ -103,7 +108,6 @@ jobs:
           print("Platform:", sysconfig.get_platform())
           PY
 
-          cd /out
           sha256sum "$(basename "$FINAL_WHEEL")" > SHA256SUMS
           printf 'Locked source commit: %s\n' "$COMMIT" > SOURCE_COMMIT.txt
           ls -lh /out
