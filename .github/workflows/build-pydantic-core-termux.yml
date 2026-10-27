@@ -21,9 +21,9 @@ jobs:
 
           pkg update
           pkg upgrade -y
-          pkg install -y python rust clang make pkg-config maturin curl coreutils
+          pkg install -y python rust clang make pkg-config maturin curl coreutils tar
 
-          python -m pip install --upgrade setuptools wheel
+          python -m pip install --upgrade setuptools wheel typing-extensions
           export ANDROID_API_LEVEL=24
           export CARGO_BUILD_JOBS=2
 
@@ -44,13 +44,20 @@ jobs:
           EXPECTED_SHA256="e50d7b94baac6c7d09927fa5ca5800a0c7ee5015c7fcff65beb3a1931b5a6e09"
 
           curl -fL --retry 3 "$URL" -o "$SDIST"
-          printf "%s  %s\\n" "$EXPECTED_SHA256" "$SDIST" | sha256sum -c -
+          printf "%s  %s\n" "$EXPECTED_SHA256" "$SDIST" | sha256sum -c -
 
-          python -m pip wheel \
-            --no-deps \
-            --no-build-isolation \
-            --wheel-dir=/out \
-            "$SDIST"
+          # Ekstrak tarball pydantic-core
+          SRC_DIR="$PREFIX/tmp/pydantic_core_src"
+          mkdir -p "$SRC_DIR"
+          tar -xzf "$SDIST" -C "$SRC_DIR" --strip-components=1
+          cd "$SRC_DIR"
+
+          # Build .whl langsung dengan maturin CLI
+          maturin build \
+            --release \
+            --strip \
+            --out /out \
+            --interpreter python
 
           BUILT="$(find /out -maxdepth 1 -type f -name "pydantic_core-2.50.1-*.whl" -print -quit)"
           if [ -z "$BUILT" ]; then
@@ -62,8 +69,6 @@ jobs:
           case "$BUILT" in
               *-cp314-cp314-android_24_arm64_v8a.whl) ;;
               *)
-                  # Package-scoped retag: this wheel was built in Termux/Bionic,
-                  # not on the host Ubuntu runner.
                   wheel tags \
                     --python-tag=cp314 \
                     --abi-tag=cp314 \
