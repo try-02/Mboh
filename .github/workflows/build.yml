@@ -1,0 +1,41 @@
+name: Build Zerostack Termux Native
+
+on:
+  workflow_dispatch: # Mengizinkan trigger build secara manual dari tab Actions
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    # Menggunakan runner ARM64 native agar proses compile sangat cepat tanpa emulasi
+    runs-on: ubuntu-26.04-arm
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Siapkan Direktori Output
+        run: mkdir -p output
+
+      - name: Compile Zerostack di dalam Termux Docker
+        run: |
+          docker run --rm --privileged \
+            -v "${{ github.workspace }}:/workspace" \
+            termux/termux-docker:aarch64 \
+            sh -c "
+              pkg update -y && pkg upgrade -y \
+              pkg install -y rust git clang pkg-config openssl binutils && \
+              cargo install zerostack --root /workspace/output && \
+              strip /workspace/output/bin/zerostack
+            "
+
+      - name: Kompres Binary
+        run: |
+          tar -czvf zerostack-aarch64-termux.tar.gz -C output/bin zerostack
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: zerostack-aarch64-termux
+          path: zerostack-aarch64-termux.tar.gz
