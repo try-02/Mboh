@@ -24,7 +24,8 @@ jobs:
             -v "${{ github.workspace }}:/workspace" \
             termux/termux-docker:aarch64 \
             sh -c "
-              apt update && apt upgrade -y \
+              apt update && \
+              apt upgrade -y \
               apt install -y rust git clang pkg-config openssl binutils && \
               cargo install zerostack --root /workspace/output && \
               strip /workspace/output/bin/zerostack
