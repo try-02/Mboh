@@ -1,4 +1,4 @@
-ame: Build Zerostack Termux Native
+name: Build Zerostack Termux Native
 
 on:
   workflow_dispatch:
