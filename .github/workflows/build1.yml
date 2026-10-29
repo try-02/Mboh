@@ -1,0 +1,77 @@
+name: Build Zerostack Termux Native1
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04-arm # Runner ARM64 gratis & cepat
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      # 1. Buat folder output dan beri hak akses penuh (Fix Permission Denied)
+      - name: Siapkan Direktori Output & Hak Akses
+        run: |
+          mkdir -p output
+          chmod -R 777 "${{ github.workspace }}"
+
+      # 2. Kompilasi di direktori internal Termux Docker
+      - name: Compile Zerostack di dalam Termux Docker
+        run: |
+          docker run --rm --privileged \
+            -v "${{ github.workspace }}:/workspace" \
+            termux/termux-docker:aarch64 \
+            sh -c '
+              # Update dan pasang build toolchain
+              apt update && apt upgrade -y && \
+              apt install -y rust git clang pkg-config openssl binutils make && \
+
+              # Masuk ke direktori home internal Termux (bebas masalah permission)
+              cd /data/data/com.termux/files/home && \
+
+              # Clone repo resmi zerostack
+              git clone --depth 1 https://github.com/gi-dellav/zerostack.git && \
+              cd zerostack && \
+
+              # Kompilasi mode release
+              cargo build --release && \
+
+              # Pangkas ukuran file binary
+              strip target/release/zerostack && \
+
+              # Salin binary yang sudah jadi ke folder output GitHub Workspace
+              cp target/release/zerostack /workspace/output/zerostack
+            '
+
+      # 3. Kembalikan ownership file ke user GitHub Runner
+      - name: Perbaiki Izin File Output
+        if: always()
+        run: sudo chown -R $USER:$USER "${{ github.workspace }}"
+
+      # 4. Bungkus file binary menjadi tar.gz
+      - name: Kompres Binary
+        run: |
+          cd output
+          tar -czvf ../zerostack-aarch64-termux.tar.gz zerostack
+
+      # 5. Simpan file sebagai Artifact
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: zerostack-aarch64-termux
+          path: zerostack-aarch64-termux.tar.gz
+
+      # 6. Publikasikan ke GitHub Release
+      - name: Buat GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: termux-build
+          name: "Zerostack Termux Native aarch64"
+          files: zerostack-aarch64-termux.tar.gz
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
