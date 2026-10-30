@@ -32,6 +32,11 @@ jobs:
               # 2. Clone repo Zerostack ke direktori internal Termux
               cd /data/data/com.termux/files/home && \
               git clone --depth 1 https://github.com/gi-dellav/zerostack.git && \
+              cp zero/data/prompts/* zerostack/data/prompts/ && \
+              cp zero/src/agent/tools/* zerostack/src/agent/tools/ && \
+              cp zero/src/startup.rs zerostack/src/ && \
+              cp zero/src/extras/subagents/task_tool.rs zerostack/src/extras/subagents/ && \
+              cp zero/src/agent/prompt.rs zerostack/src/agent/ && \
               cd zerostack && \
 
               # 3. Vendor dependencies ke folder lokal
