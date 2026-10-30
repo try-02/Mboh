@@ -41,7 +41,7 @@ jobs:
               cd zerostack && \
 
               # 3. Vendor dependencies ke folder lokal
-              cargo vendor vendor && \
+              cargo vendor --all-features vendor && \
 
               # 4. Arahkan Cargo untuk memakai dependensi lokal
               mkdir -p .cargo && \
@@ -56,7 +56,7 @@ jobs:
               done && \
 
               # 7. Kompilasi mode release
-              cargo build --release && \
+              cargo build --release --all-features && \
 
               # 8. Pangkas ukuran file (strip)
               strip target/release/zerostack && \
