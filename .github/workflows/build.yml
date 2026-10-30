@@ -39,6 +39,7 @@ jobs:
               cp Mboh/zero/src/extras/subagents/task_tool.rs zerostack/src/extras/subagents/ && \
               cp Mboh/zero/src/agent/prompt.rs zerostack/src/agent/ && \
               cp Mboh/zero/src/extras/advisor/mod.rs zerostack/src/extras/advisor/ && \
+              cp Mboh/zero/src/extras/memory/mod.rs zerostack/src/extras/memory/ && \
               cd zerostack && \
 
               # 3. Vendor dependencies ke folder lokal
