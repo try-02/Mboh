@@ -41,7 +41,7 @@ jobs:
               cd zerostack && \
 
               # 3. Vendor dependencies ke folder lokal
-              cargo vendor --all-features vendor && \
+              cargo vendor vendor && \
 
               # 4. Arahkan Cargo untuk memakai dependensi lokal
               mkdir -p .cargo && \
