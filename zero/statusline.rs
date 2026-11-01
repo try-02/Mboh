@@ -250,6 +250,12 @@ fn resolve_item(
             .then(|| fmt_tokens(session.total_input_tokens)),
         "tokens_output" => (session.total_output_tokens > 0 || always)
             .then(|| fmt_tokens(session.total_output_tokens)),
+        "tokens_cached" => (session.total_cached_input_tokens > 0 || always)
+            .then(|| fmt_tokens(session.total_cached_input_tokens)),
+        "cache_hit_rate" => (session.total_input_tokens > 0 || always)
+            .then(|| format!("{:.1}%", session.cache_hit_rate())),
+        "cache" => (session.total_cached_input_tokens > 0)
+            .then(|| format!("{}({:.0}%)", fmt_tokens(session.total_cached_input_tokens), session.cache_hit_rate())),
         "context_used" => {
             // A `~` marks the figure as an estimate until the provider reports
             // real usage (it then snaps to the exact number).
@@ -538,6 +544,8 @@ pub fn default_spec() -> StatusLineConfig {
         seg("tokens_input", Some("dark_grey")),
         sep(" \u{21d3}"),
         seg("tokens_output", Some("dark_grey")),
+        sep(" \u{26a1}"), // Simbol petir ⚡ (cepat/cache)
+        seg("cache", Some("dark_grey")),
         StatusLineSegment {
             item: "flex_separator".into(),
             ..Default::default()
