@@ -60,6 +60,7 @@ jobs:
               done && \
 
               # 7. Kompilasi mode release
+              cargo fix --bin "zerostack" -p zerostack --allow-no-vcs && \
               cargo build --release --all-features && \
 
               # 8. Pangkas ukuran file (strip)
