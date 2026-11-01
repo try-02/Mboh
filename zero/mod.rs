@@ -153,6 +153,8 @@ pub struct Session {
     #[serde(default)]
     pub cache_diagnostics: Vec<CacheDiagnosticEntry>,
     #[serde(default)]
+    pub prefix_hash: u64,
+    #[serde(default)]
     pub calibrated_tokens: u64,
     #[serde(default)]
     pub calibrated_msg_count: usize,
@@ -272,6 +274,7 @@ impl Session {
             total_cost: 0.0,
             total_estimated_tokens: 0,
             cache_diagnostics: Vec::new(),
+            prefix_hash: 0,
             calibrated_tokens: 0,
             calibrated_msg_count: 0,
             input_token_cost: 0.0,
@@ -321,16 +324,38 @@ impl Session {
         }
     }
 
+    /// Mendeteksi mekanisme caching berdasarkan provider & model aktif
+    pub fn cache_mechanism(&self) -> &'static str {
+        let prov = self.provider.to_lowercase();
+        let mdl = self.model.to_lowercase();
+
+        if prov.contains("openrouter") {
+            "OpenRouter (Sticky Routing + Prefix Cache)"
+        } else if prov.contains("nvidia") || mdl.contains("nemotron") || prov.contains("nvcap") {
+            "NVIDIA NIM / vLLM (Prefix Block Paging)"
+        } else if prov.contains("anthropic") || mdl.contains("claude") {
+            "Anthropic (Prompt Cache Breakpoints)"
+        } else if prov.contains("openai") || mdl.contains("gpt") {
+            "OpenAI (Automatic Prompt Caching)"
+        } else {
+            "Generic Prefix Caching"
+        }
+    }
+
     /// Mencatat diagnosa setiap kali request API selesai
-    pub fn record_cache_call(&mut self, input_tokens: u64, cached_tokens: u64) {
+    pub fn record_cache_call(&mut self, input_tokens: u64, cached_tokens: u64, prefix_matched: bool) {
         let req_index = self.cache_diagnostics.len() + 1;
         let hit = cached_tokens > 0;
         let note = if req_index == 1 && !hit {
-            CompactString::new("Cold start (initial request)")
+            CompactString::new("Initial request (cold cache)")
         } else if hit {
             CompactString::new("Prefix cache hit")
+        } else if !prefix_matched {
+            // Terbukti prefix berubah (system prompt / tools dimodifikasi)
+            CompactString::new("MISS: Cache prefix mismatch")
         } else {
-            CompactString::new("Cache miss (prefix change or route shift)")
+            // Prefix identik tapi miss (artinya server GPU membuang cache / worker baru)
+            CompactString::new("MISS: Server cache eviction / worker shift")
         };
 
         self.cache_diagnostics.push(CacheDiagnosticEntry {
@@ -348,6 +373,8 @@ impl Session {
         let sid = if self.id.len() >= 8 { &self.id[..8] } else { &self.id };
         out.push_str("KV / PROMPT CACHE SUMMARY\n");
         out.push_str(&format!("├── Session ID : {}\n", sid));
+        out.push_str(&format!("├── Provider   : {} ({})\n", self.provider, self.model));
+        out.push_str(&format!("├── Mechanism  : {}\n", self.cache_mechanism()));
         out.push_str(&format!("├── Status     : {}\n", self.cache_status()));
         out.push_str(&format!("├── Hit Rate   : {:.2}%\n", self.cache_hit_rate()));
         out.push_str(&format!("├── Cached     : {} ({} tokens)\n", crate::ui::statusline::fmt_tokens(self.total_cached_input_tokens), self.total_cached_input_tokens));
@@ -371,6 +398,23 @@ impl Session {
             }
         }
         out
+    }
+
+    /// Menghitung sidik jari (hash) prefix untuk memverifikasi stabilitas KV Cache
+    pub fn update_prefix_guard(&mut self, preamble: &str) -> bool {
+        use std::hash::{DefaultHasher, Hasher};
+        let mut hasher = DefaultHasher::new();
+        hasher.write(preamble.as_bytes());
+        let current_hash = hasher.finish();
+
+        if self.prefix_hash == 0 {
+            // Giliran pertama: simpan sidik jari awal
+            self.prefix_hash = current_hash;
+            true
+        } else {
+            // Giliran berikutnya: bandingkan apakah prefix bergeser
+            self.prefix_hash == current_hash
+        }
     }
 
     /// Read the current git branch for `dir`, or `None` outside a repo / on a
