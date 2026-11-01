@@ -1,482 +1,921 @@
-pub(crate) mod add;
-mod content;
-mod features;
-mod help;
-#[cfg(feature = "hooks")]
-mod hooks;
-// `pub`: the headless [`Engine`](crate::engine::Engine) spawns the same
-// deferred AGENTS.md-creation prompt as the TUI.
-pub mod init;
-mod memory;
-mod outcome;
-mod providers;
-// `pub`: the headless [`Engine`](crate::engine::Engine) spawns the same
-// deferred review prompt as the TUI.
-pub mod review;
-mod session;
-pub(crate) mod settings;
+pub mod chat_history;
+pub mod storage;
 
-pub use outcome::SlashOutcome;
+use std::path::Path;
 
-pub(crate) use providers::{cached_model_ids, warm_model_cache};
+use compact_str::CompactString;
+use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
-use smallvec::SmallVec;
+pub const TOOL_RESULT_HEAD_CHARS: usize = 4_000;
+pub const TOOL_RESULT_TAIL_CHARS: usize = 8_000;
+pub const TOOL_RESULT_SAVE_THRESHOLD: usize = TOOL_RESULT_HEAD_CHARS + TOOL_RESULT_TAIL_CHARS;
 
-use crate::cli::Cli;
-use crate::config::Config;
-use crate::context::ContextFiles;
-use crate::permission::ask::AskSender;
-use crate::permission::checker::PermCheck;
-use crate::provider::{AnyAgent, AnyClient};
-use crate::sandbox::Sandbox;
-use crate::session::{MessageRole, Session};
-use crate::ui::events::render_session;
-use crate::ui::input::InputEditor;
-use crate::ui::renderer::Renderer;
-use crate::ui::state::{AgentBuildCtx, AgentRunState, ChainState, SlashState, UiContext};
-
-pub(crate) const C_AGENT: crossterm::style::Color = crossterm::style::Color::White;
-pub(crate) const C_RESULT: crossterm::style::Color = crossterm::style::Color::DarkGrey;
-pub(crate) const C_ERROR: crossterm::style::Color = crossterm::style::Color::Red;
-
-pub struct SlashCtx<'a> {
-    pub agent: &'a mut Option<AnyAgent>,
-    pub client: &'a mut AnyClient,
-    pub renderer: &'a mut Renderer,
-    pub session: &'a mut Session,
-    pub cli: &'a Cli,
-    pub cfg: &'a Config,
-    pub context: &'a mut ContextFiles,
-    pub show_reasoning: &'a mut bool,
-    pub reasoning_enabled: &'a mut bool,
-    pub is_running: &'a mut bool,
-    pub input: &'a mut InputEditor,
-    pub permission: &'a Option<PermCheck>,
-    pub ask_tx: &'a Option<AskSender>,
-    pub todo_tools_enabled: &'a mut bool,
-    pub sandbox: &'a Sandbox,
-    #[cfg(feature = "loop")]
-    pub loop_state: &'a mut Option<crate::extras::r#loop::LoopState>,
-    #[cfg(feature = "mcp")]
-    pub mcp_manager: Option<&'a crate::extras::mcp::McpClientManager>,
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MessageRole {
+    User,
+    Assistant,
+    System,
+    ToolCall,
+    ToolResult,
+    SubagentToolCall,
 }
 
-impl SlashCtx<'_> {
-    /// Borrow the pieces [`AgentBuildCtx::rebuild_agent`] needs.
-    fn agent_build_ctx(&self) -> AgentBuildCtx<'_> {
-        AgentBuildCtx {
-            cli: self.cli,
-            cfg: self.cfg,
-            context: self.context,
-            client: self.client,
-            permission: self.permission,
-            ask_tx: self.ask_tx,
-            sandbox: self.sandbox,
-            #[cfg(feature = "mcp")]
-            mcp_manager: self.mcp_manager,
-        }
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionMessage {
+    pub role: MessageRole,
+    pub content: CompactString,
+    pub estimated_tokens: u64,
+    #[serde(default)]
+    pub tool: Option<ToolRecord>,
+}
+
+/// Structured, machine-readable counterpart to a `ToolCall`/`ToolResult`
+/// message's display summary in `content`. `Call` carries the complete,
+/// untruncated argument JSON; `Result` carries linkage and truncation
+/// metadata only (the result text itself stays solely in `content`, governed
+/// by the existing threshold and overflow-file mechanism — see
+/// `Session::tool_result_content`).
+///
+/// `#[serde(untagged)]`: the variants are structurally disjoint (`Call` has
+/// `id`/`args`, `Result` has `call_id`/`truncated`, `SubagentCall` has
+/// `parent_call_id`/`args`), so untagged deserialization picks the right one
+/// unambiguously; this keeps the JSON shape flat (no extra `type`
+/// discriminant) matching the schema already reviewed upstream.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ToolRecord {
+    Call {
+        id: u64,
+        name: CompactString,
+        args: serde_json::Value,
+    },
+    Result {
+        call_id: u64,
+        name: CompactString,
+        truncated: bool,
+        full_output_path: Option<CompactString>,
+    },
+    /// A tool call made by a subagent, attributed to the enclosing `task`
+    /// call via `parent_call_id` (the `Call` record's `id`). Deliberately has
+    /// no `id` of its own: subagent tool *results* have no event to record
+    /// (design.md Non-Goals), so nothing ever links back to one, and an `id`
+    /// field here would make this variant's JSON also satisfy `Call` — which,
+    /// being listed first, would win the untagged match. `parent_call_id` is
+    /// required for the same reason: it is what keeps the two disjoint.
+    SubagentCall {
+        parent_call_id: u64,
+        name: CompactString,
+        args: serde_json::Value,
+    },
+}
+
+/// A single-step restore point captured before a conversation rewind, so the
+/// destructive truncation can be undone with `/unrewind`. Holds the full
+/// message list and the calibration/estimate fields that `truncate_to` mutates,
+/// which is everything needed to put the session back exactly as it was. Not
+/// persisted: a rewind is only undoable within the session that made it.
+#[derive(Debug, Clone)]
+pub struct RewindUndo {
+    messages: Vec<SessionMessage>,
+    total_estimated_tokens: u64,
+    calibrated_tokens: u64,
+    calibrated_msg_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Compaction {
+    pub summary: CompactString,
+    pub first_kept_index: usize,
+    pub summarized_count: usize,
+    pub token_savings: u64,
+    pub created_at: CompactString,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CacheDiagnosticEntry {
+    pub req_index: usize,
+    pub input_tokens: u64,
+    pub cached_tokens: u64,
+    pub hit: bool,
+    pub note: CompactString,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PermissionAllowEntry {
+    pub tool: CompactString,
+    pub pattern: CompactString,
+}
+
+/// Whether a session's active prompt content was the compiled-in default or
+/// a user customization. `UserFile` means the text that shaped the session
+/// differed from the compiled-in one, or had no compiled-in counterpart at
+/// all; a file merely existing on disk is not enough, since the global
+/// prompts dir is seeded with every default on first run. See
+/// [`prompts::source_of`](crate::context::prompts::source_of) (or
+/// [`source_of_with_extra`](crate::context::prompts::source_of_with_extra)
+/// when CLI `--prompts-dir` dirs are in play).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptSource {
+    BuiltIn,
+    UserFile,
+}
+
+/// Which prompt shaped the session: its name and where its content came
+/// from. Last one wins; no history of switches is kept, matching what the
+/// status bar already shows.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PromptRef {
+    pub name: CompactString,
+    pub source: PromptSource,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Session {
+    pub id: CompactString,
+    pub name: CompactString,
+    pub messages: Vec<SessionMessage>,
+    pub compactions: Vec<Compaction>,
+    pub created_at: CompactString,
+    pub updated_at: CompactString,
+    #[serde(default)]
+    pub total_input_tokens: u64,
+    #[serde(default)]
+    pub total_output_tokens: u64,
+    #[serde(default)]
+    pub total_cached_input_tokens: u64,
+    #[serde(default)]
+    pub total_cache_creation_input_tokens: u64,
+    pub total_cost: f64,
+    pub total_estimated_tokens: u64,
+    #[serde(default)]
+    pub cache_diagnostics: Vec<CacheDiagnosticEntry>,
+    #[serde(default)]
+    pub prefix_hash: u64,
+    #[serde(default)]
+    pub calibrated_tokens: u64,
+    #[serde(default)]
+    pub calibrated_msg_count: usize,
+    #[serde(default)]
+    pub input_token_cost: f64,
+    #[serde(default)]
+    pub output_token_cost: f64,
+    pub context_window: u64,
+    pub model: CompactString,
+    pub provider: CompactString,
+    pub working_dir: CompactString,
+    #[serde(default)]
+    pub permission_allowlist: Vec<PermissionAllowEntry>,
+    /// Counter stamping `ToolRecord::Call.id`, persisted so ids stay unique
+    /// across a `--continue`/resume rather than restarting at 0 and
+    /// colliding with ids already in `messages`. Old session files predate
+    /// structured tool records entirely, so defaulting to 0 on load is safe:
+    /// there are no existing ids to collide with.
+    #[serde(default)]
+    pub next_tool_call_id: u64,
+    /// The prompt active when the session was last saved: name and source
+    /// (built-in vs user file). `None` for sessions with no active prompt,
+    /// and for files written before this field existed.
+    #[serde(default)]
+    pub prompt: Option<PromptRef>,
+    #[cfg(feature = "multimodal")]
+    #[serde(skip)]
+    pub pending_media: Vec<crate::extras::multimodal::MediaAttachment>,
+    /// Display preference (set from config at startup, not persisted): show the
+    /// session cost in the status bar even when it is $0.0000.
+    #[serde(skip)]
+    pub show_cost_always: bool,
+    /// Current git branch of `working_dir`, for the status bar. Refreshed at
+    /// runtime, not persisted.
+    #[serde(skip)]
+    pub git_branch: Option<CompactString>,
+    /// Working-tree change counts and upstream sync, for the status bar.
+    /// Computed only when the statusline uses a git change/status item. Not persisted.
+    #[serde(skip)]
+    pub git_status: Option<GitStatus>,
+    /// Whether reasoning is currently enabled, for the status bar. Synced from
+    /// the event loop, not persisted.
+    #[serde(skip)]
+    pub reasoning_enabled: bool,
+    /// Estimated tokens for the fixed request overhead that never lives in
+    /// `messages` — system prompt, tool-use preamble, context files, memory.
+    /// Used only before the first real calibration (see
+    /// [`effective_context_tokens`](Self::effective_context_tokens)); once the
+    /// provider reports real usage, the calibration anchor already includes this
+    /// overhead, so it must not be added again. Recomputed at runtime, not
+    /// persisted.
+    #[serde(skip)]
+    pub overhead_tokens: u64,
+    /// Restore point for the most recent `/unrewind`-able rewind, captured by
+    /// [`rewind_to`](Self::rewind_to). Runtime only, not persisted.
+    #[serde(skip)]
+    pub rewind_undo: Option<RewindUndo>,
+}
+
+/// Working-tree summary parsed from `git status --porcelain=v2 --branch`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GitStatus {
+    pub staged: u32,
+    pub modified: u32,
+    pub deleted: u32,
+    pub untracked: u32,
+    pub ahead: u32,
+    pub behind: u32,
+}
+
+impl GitStatus {
+    pub fn is_dirty(&self) -> bool {
+        self.staged + self.modified + self.deleted + self.untracked > 0
     }
+}
 
-    pub async fn rebuild_agent(&mut self) {
-        #[cfg(feature = "advisor")]
-        {
-            crate::extras::advisor::update_client(self.client.clone());
-            crate::extras::advisor::set_session_messages(self.session.messages.clone());
-        }
-        let new_agent = self
-            .agent_build_ctx()
-            .rebuild_agent(&self.session.model, *self.reasoning_enabled)
-            .await;
-        *self.agent = Some(new_agent);
-    }
-
-    pub async fn rebuild_agent_with_client(
-        &mut self,
-        provider: &str,
-        new_reasoning: bool,
-    ) -> Result<(), anyhow::Error> {
-        *self.client = crate::provider::create_client(
-            provider,
-            self.cli.api_key.as_deref(),
-            &self.cfg.custom_providers_map(),
-            self.cfg.api_keys.as_ref(),
-        )?;
-        #[cfg(feature = "advisor")]
-        {
-            crate::extras::advisor::update_client(self.client.clone());
-            crate::extras::advisor::set_session_messages(self.session.messages.clone());
-        }
-        let new_agent = self
-            .agent_build_ctx()
-            .rebuild_agent(&self.session.model, new_reasoning)
-            .await;
-        *self.agent = Some(new_agent);
-        Ok(())
-    }
-
-    /// Switch to the quick-model configured in `[prompt_to_model]` for the
-    /// given prompt name. Returns `true` if a model switch occurred (and the
-    /// agent was rebuilt). When `false`, the caller should call
-    /// `rebuild_agent()` to pick up other prompt changes (mode directive, etc.).
-    pub async fn switch_to_prompt_model(&mut self, prompt_name: &str) -> bool {
-        let qm_name = match self.cfg.resolve_prompt_model(prompt_name) {
-            Some(name) => name,
-            None => return false,
-        };
-
-        let qm = crate::config::quick_models_map(self.cfg);
-        let Some(qmc) = qm.get(qm_name) else {
-            return false;
-        };
-
-        let new_model = compact_str::CompactString::from(&*qmc.model);
-        let provider_changed = qmc.provider != self.session.provider;
-
-        // Update model before rebuild so the agent is built with it.
-        self.session.model = new_model.clone();
-
-        if provider_changed {
-            match self
-                .rebuild_agent_with_client(&qmc.provider, *self.reasoning_enabled)
-                .await
-            {
-                Ok(()) => {
-                    self.session.provider = compact_str::CompactString::from(&*qmc.provider);
-                }
-                Err(e) => {
-                    let _ = self.renderer.write_line(
-                        &format!(
-                            "failed to switch provider for prompt '{}': {}",
-                            prompt_name, e
-                        ),
-                        C_ERROR,
-                    );
-                    return false;
-                }
+impl Session {
+    pub fn estimate_tokens(text: &str) -> u64 {
+        let mut wide: u64 = 0;
+        let mut narrow: u64 = 0;
+        for ch in text.chars() {
+            if Self::is_wide_char(ch) {
+                wide += 1;
+            } else {
+                narrow += 1;
             }
-        } else {
-            #[cfg(feature = "advisor")]
-            {
-                crate::extras::advisor::update_client(self.client.clone());
-                crate::extras::advisor::set_session_messages(self.session.messages.clone());
-            }
-            let new_agent = self
-                .agent_build_ctx()
-                .rebuild_agent(&new_model, *self.reasoning_enabled)
-                .await;
-            *self.agent = Some(new_agent);
         }
-
-        self.session.input_token_cost = qmc.input_token_cost;
-        self.session.output_token_cost = qmc.output_token_cost;
-        self.session
-            .update_context_window(self.cfg.resolve_context_window(
-                &self.session.provider,
-                &self.session.model,
-                &crate::config::quick_models_map(self.cfg),
-            ));
-
-        let _ = self.renderer.write_line(
-            &format!(
-                "switched to model: {} (from prompt '{}')",
-                qm_name, prompt_name
-            ),
-            C_AGENT,
-        );
-        true
-    }
-}
-
-/// Free-function variant of [`SlashCtx::switch_to_prompt_model`] for call
-/// sites that don't have a `SlashCtx` (dot commands, chain transitions,
-/// startup). Returns `true` if a model switch occurred.
-pub(crate) async fn apply_prompt_model(
-    prompt_name: &str,
-    ui: &mut UiContext<'_>,
-    agent: &mut Option<AnyAgent>,
-    reasoning_enabled: bool,
-    renderer: &mut Renderer,
-) -> bool {
-    let qm_name = match ui.cfg.resolve_prompt_model(prompt_name) {
-        Some(name) => name,
-        None => return false,
-    };
-
-    let qm = crate::config::quick_models_map(ui.cfg);
-    let Some(qmc) = qm.get(qm_name) else {
-        return false;
-    };
-
-    let new_model = compact_str::CompactString::from(&*qmc.model);
-    let provider_changed = qmc.provider != ui.session.provider;
-
-    ui.session.model = new_model.clone();
-
-    if provider_changed {
-        match crate::provider::create_client(
-            &qmc.provider,
-            ui.cli.api_key.as_deref(),
-            &ui.cfg.custom_providers_map(),
-            ui.cfg.api_keys.as_ref(),
-        ) {
-            Ok(new_client) => {
-                ui.client = new_client;
-                ui.session.provider = compact_str::CompactString::from(&*qmc.provider);
-                // Fall through to rebuild agent below
-            }
-            Err(e) => {
-                let _ = renderer.write_line(
-                    &format!(
-                        "failed to switch provider for prompt '{}': {}",
-                        prompt_name, e
-                    ),
-                    C_ERROR,
-                );
-                return false;
-            }
-        }
+        // wide * 0.9 + narrow / 4, min 1
+        ((wide * 9 / 10) + narrow / 4).max(1)
     }
 
-    #[cfg(feature = "advisor")]
-    {
-        crate::extras::advisor::update_client(ui.client.clone());
-        crate::extras::advisor::set_session_messages(ui.session.messages.clone());
-    }
-    *agent = Some(
-        ui.agent_build_ctx()
-            .rebuild_agent(&new_model, reasoning_enabled)
-            .await,
-    );
-
-    ui.session.input_token_cost = qmc.input_token_cost;
-    ui.session.output_token_cost = qmc.output_token_cost;
-    ui.session
-        .update_context_window(ui.cfg.resolve_context_window(
-            &ui.session.provider,
-            &ui.session.model,
-            &qm,
-        ));
-
-    let _ = renderer.write_line(
-        &format!(
-            "switched to model: {} (from prompt '{}')",
-            qm_name, prompt_name
-        ),
-        C_AGENT,
-    );
-    true
-}
-
-pub(crate) fn write_ok(renderer: &mut Renderer, msg: impl std::fmt::Display) {
-    let _ = renderer.write_line(&msg.to_string(), C_AGENT);
-}
-
-pub(crate) fn write_result(renderer: &mut Renderer, msg: impl std::fmt::Display) {
-    let _ = renderer.write_line(&msg.to_string(), C_RESULT);
-}
-
-pub(crate) fn write_error(renderer: &mut Renderer, msg: impl std::fmt::Display) {
-    let _ = renderer.write_line(&msg.to_string(), C_ERROR);
-}
-
-/// `pub` (not `pub(crate)`): the headless [`Engine`](crate::engine::Engine)
-/// reuses the same undo primitive as `/undo`.
-pub fn undo_last(session: &mut Session) -> usize {
-    let len = session.messages.len();
-    if len == 0 {
-        return 0;
-    }
-    let removed = if session.messages[len - 1].role == MessageRole::Assistant {
-        if len >= 2 && session.messages[len - 2].role == MessageRole::User {
-            2
-        } else {
-            1
-        }
-    } else if session.messages[len - 1].role == MessageRole::User {
-        1
-    } else {
-        0
-    };
-    // Rewind via the session helper so the context figure tracks the shortened
-    // history (subtracts the removed turn from the calibration anchor rather than
-    // going stale or resetting to a cold estimate) and the cut is reversible with
-    // /redo.
-    if removed > 0 {
-        session.rewind_to(len - removed);
-    }
-    removed
-}
-
-pub async fn handle_compress(
-    instructions: Option<&str>,
-    auto: bool,
-    agent: &mut Option<AnyAgent>,
-    renderer: &mut Renderer,
-    ui: &mut UiContext<'_>,
-    reasoning_enabled: bool,
-) -> anyhow::Result<()> {
-    // Mirror the auto-compaction trigger's reserve exactly (including memory's
-    // effective_reserve) so the budget gate here can never disagree with the
-    // gate that decided to call us.
-    let qm = crate::config::quick_models_map(ui.cfg);
-    #[cfg(feature = "memory")]
-    let reserve = crate::extras::memory::effective_reserve(
-        ui.cfg.resolve_reserve_tokens(&ui.session.model, &qm),
-        ui.context.memory.as_deref(),
-    );
-    #[cfg(not(feature = "memory"))]
-    let reserve = ui.cfg.resolve_reserve_tokens(&ui.session.model, &qm);
-    let keep_recent = ui.cfg.resolve_keep_recent_tokens();
-    let max_tokens = ui.session.context_window.saturating_sub(reserve);
-
-    // Auto-compaction only makes sense when actually over budget; manual
-    // /compress is the user's explicit intent, so it skips the budget gate and
-    // proceeds regardless of how full the context is.
-    if auto && ui.session.effective_context_tokens() <= max_tokens {
-        return Ok(());
-    }
-
-    let cut_idx = crate::session::Session::select_compaction_cut(&ui.session.messages, keep_recent);
-
-    // Nothing old enough to summarize (everything is within keep_recent). This
-    // is a real physical limit even when forced, so report it for manual runs;
-    // stay silent under auto so an over-budget-but-unsummarizable turn does not
-    // announce a no-op on every completion.
-    if cut_idx == 0 {
-        if !auto {
-            renderer.write_line("not enough conversation history to compact yet", C_AGENT)?;
-        }
-        return Ok(());
-    }
-
-    // Announce only once we know compression will actually run.
-    if auto {
-        renderer.write_line("auto-compacting...", crossterm::style::Color::DarkGrey)?;
-    } else {
-        renderer.write_line("compressing...", C_AGENT)?;
-    }
-    renderer.write_line("", crossterm::style::Color::White)?;
-
-    let messages_to_summarize = &ui.session.messages[..cut_idx];
-    let previous_summary = ui.session.compactions.last().map(|c| c.summary.as_str());
-
-    let summary = ui
-        .client
-        .compress_messages(
-            &ui.session.model,
-            messages_to_summarize,
-            previous_summary,
-            instructions,
+    fn is_wide_char(ch: char) -> bool {
+        matches!(ch as u32,
+            0x1100..=0x11FF |   // Hangul Jamo
+            0x2E80..=0x9FFF |   // CJK radicals/Kangxi/punctuation/kana/Unified+ExtA
+            0xA000..=0xA4CF |   // Yi
+            0xAC00..=0xD7A3 |   // Hangul Syllables
+            0xF900..=0xFAFF |   // CJK Compatibility Ideographs
+            0xFF00..=0xFFEF |   // Halfwidth/Fullwidth Forms
+            0x20000..=0x3FFFF   // Supplementary Ideographic Plane (Ext B–F)
         )
-        .await?;
+    }
 
-    let tokens_before: u64 = messages_to_summarize
-        .iter()
-        .map(|m| m.estimated_tokens)
-        .sum();
-
-    #[cfg(feature = "memory")]
-    crate::extras::memory::flush_compaction_summary(
-        &crate::extras::memory::Mem::open(),
-        &summary,
-        Some(cut_idx), // = first_kept_index: how many messages were summarized
-    );
-    ui.session.compress(summary, cut_idx, tokens_before);
-
-    *agent = Some(
-        ui.agent_build_ctx()
-            .rebuild_agent(&ui.session.model, reasoning_enabled)
-            .await,
-    );
-
-    render_session(renderer, ui.session, ui.cli, ui.cfg, ui.context)?;
-    renderer.write_line(
-        &format!(
-            "compressed {} messages (saved ~{} tokens)",
-            cut_idx, tokens_before,
-        ),
-        C_AGENT,
-    )?;
-
-    Ok(())
-}
-
-pub async fn handle_slash(
-    text: &str,
-    renderer: &mut Renderer,
-    input: &mut InputEditor,
-    run: &mut AgentRunState,
-    ui: &mut UiContext<'_>,
-    slash: &mut SlashState,
-    chain: &mut ChainState,
-) -> anyhow::Result<()> {
-    // `chain` only feeds `SlashCtx::loop_state`; without the loop feature it
-    // has no consumer here.
-    #[cfg(not(feature = "loop"))]
-    let _ = &chain;
-    let parts: SmallVec<[&str; 3]> = text.trim().splitn(3, ' ').collect();
-    let mut ctx = SlashCtx {
-        agent: &mut run.agent,
-        client: &mut ui.client,
-        renderer,
-        session: ui.session,
-        cli: ui.cli,
-        cfg: ui.cfg,
-        context: ui.context,
-        show_reasoning: &mut slash.show_reasoning,
-        reasoning_enabled: &mut slash.reasoning_enabled,
-        is_running: &mut run.is_running,
-        input,
-        permission: &ui.permission,
-        ask_tx: &ui.ask_tx,
-        todo_tools_enabled: &mut slash.todo_tools_enabled,
-        sandbox: &ui.sandbox,
-        #[cfg(feature = "loop")]
-        loop_state: &mut chain.loop_state,
-        #[cfg(feature = "mcp")]
-        mcp_manager: ui.mcp_manager.as_ref(),
-    };
-
-    match parts[0] {
-        "/provider" | "/model" | "/models" | "/models-add" | "/model-subagent"
-        | "/models-subagent" => providers::handle(&parts, &mut ctx).await,
-        "/prompt" | "/theme" | "/regen-prompts" | "/regen-themes" => {
-            content::handle(&parts, &mut ctx).await
-        }
-        "/reasoning" | "/thinking" | "/mode" | "/toggle" | "/mcp" | "/editsys" | "/advisor" => {
-            settings::handle(&parts, &mut ctx).await
-        }
-        "/sessions" | "/rename" | "/clear" | "/new" | "/undo" | "/redo" | "/rewind" | "/retry"
-        | "/quit" | "/exit" | "/history" | "/cache" => session::handle(&parts, &mut ctx).await,
-        #[cfg(feature = "export")]
-        "/export" | "/import" | "/share" => session::handle(&parts, &mut ctx).await,
-        "/help" => {
-            help::handle(&parts, &mut ctx);
-            Ok(())
-        }
-        "/welcome" | "/tutorial" => {
-            help::handle_welcome(ctx.renderer, !ctx.cli.disable_lazygit);
-            Ok(())
-        }
-        "/tutor" => {
-            help::handle_tutor(ctx.renderer, ctx.cfg.resolve_mouse_capture());
-            Ok(())
-        }
-        "/add" | "/drop" | "/drop-all" => add::handle(&parts, &mut ctx).await,
-        "/init" => init::handle(&parts, &mut ctx).await,
-        "/review" => review::handle(&parts, &mut ctx).await,
-        "/memory" => memory::handle(&parts, &mut ctx).await,
-        "/compress" | "/compact" | "/loop" | "/worktree" | "/wt-merge" | "/wt-exit" => {
-            features::handle(&parts, &mut ctx).await
-        }
-        #[cfg(feature = "hooks")]
-        "/hooks" => hooks::handle(&parts, &mut ctx).await,
-        _ => {
-            write_error(
-                ctx.renderer,
-                format!("unknown command: {} (try /help)", parts[0]),
-            );
-            Ok(())
+    pub fn new(provider: &str, model: &str, context_window: u64, name: &str) -> Self {
+        let now = CompactString::new(chrono::Utc::now().to_rfc3339());
+        Session {
+            id: CompactString::new(Uuid::new_v4().to_string()),
+            name: CompactString::new(name),
+            messages: Vec::new(),
+            compactions: Vec::new(),
+            created_at: now.clone(),
+            updated_at: now,
+            total_input_tokens: 0,
+            total_output_tokens: 0,
+            total_cached_input_tokens: 0,
+            total_cache_creation_input_tokens: 0,
+            total_cost: 0.0,
+            total_estimated_tokens: 0,
+            cache_diagnostics: Vec::new(),
+            prefix_hash: 0,
+            calibrated_tokens: 0,
+            calibrated_msg_count: 0,
+            input_token_cost: 0.0,
+            output_token_cost: 0.0,
+            context_window,
+            model: CompactString::new(model),
+            provider: CompactString::new(provider),
+            working_dir: std::env::current_dir()
+                .map(|p| CompactString::new(p.to_string_lossy()))
+                .unwrap_or_default(),
+            permission_allowlist: Vec::new(),
+            next_tool_call_id: 0,
+            prompt: None,
+            #[cfg(feature = "multimodal")]
+            pending_media: Vec::new(),
+            show_cost_always: false,
+            git_branch: None,
+            git_status: None,
+            reasoning_enabled: false,
+            overhead_tokens: 0,
+            rewind_undo: None,
         }
     }
+
+    /// Menghitung jumlah token input yang tidak ter-cache (komputasi penuh oleh GPU)
+    pub fn uncached_input_tokens(&self) -> u64 {
+        self.total_input_tokens.saturating_sub(self.total_cached_input_tokens)
+    }
+
+    /// Menghitung persentase efisiensi cache (Cache Hit Rate)
+    pub fn cache_hit_rate(&self) -> f64 {
+        if self.total_input_tokens == 0 {
+            0.0
+        } else {
+            (self.total_cached_input_tokens as f64 * 100.0) / self.total_input_tokens as f64
+        }
+    }
+
+    /// Status keaktifan prompt/KV caching dari laporan provider
+    pub fn cache_status(&self) -> &'static str {
+        if self.total_cached_input_tokens > 0 {
+            "ACTIVE"
+        } else if self.total_input_tokens > 0 {
+            "MISS / INACTIVE"
+        } else {
+            "STANDBY"
+        }
+    }
+
+    /// Mendeteksi mekanisme caching berdasarkan provider & model aktif
+    pub fn cache_mechanism(&self) -> &'static str {
+        let prov = self.provider.to_lowercase();
+        let mdl = self.model.to_lowercase();
+
+        if prov.contains("openrouter") {
+            "OpenRouter (Sticky Routing + Prefix Cache)"
+        } else if prov.contains("nvidia") || mdl.contains("nemotron") || prov.contains("nvcap") {
+            "NVIDIA NIM / vLLM (Prefix Block Paging)"
+        } else if prov.contains("anthropic") || mdl.contains("claude") {
+            "Anthropic (Prompt Cache Breakpoints)"
+        } else if prov.contains("openai") || mdl.contains("gpt") {
+            "OpenAI (Automatic Prompt Caching)"
+        } else {
+            "Generic Prefix Caching"
+        }
+    }
+
+    /// Mencatat diagnosa setiap kali request API selesai
+    pub fn record_cache_call(&mut self, input_tokens: u64, cached_tokens: u64, prefix_matched: bool) {
+        let req_index = self.cache_diagnostics.len() + 1;
+        let hit = cached_tokens > 0;
+        let note = if req_index == 1 && !hit {
+            CompactString::new("Initial request (cold cache)")
+        } else if hit {
+            CompactString::new("Prefix cache hit")
+        } else if !prefix_matched {
+            // Terbukti prefix berubah (system prompt / tools dimodifikasi)
+            CompactString::new("MISS: Cache prefix mismatch")
+        } else {
+            // Prefix identik tapi miss (artinya server GPU membuang cache / worker baru)
+            CompactString::new("MISS: Server cache eviction / worker shift")
+        };
+
+        self.cache_diagnostics.push(CacheDiagnosticEntry {
+            req_index,
+            input_tokens,
+            cached_tokens,
+            hit,
+            note,
+        });
+    }
+
+    /// Menghasilkan teks laporan diagnosa pohon untuk perintah /cache
+    pub fn format_cache_report(&self) -> String {
+        let mut out = String::new();
+        let sid = if self.id.len() >= 8 { &self.id[..8] } else { &self.id };
+        out.push_str("KV / PROMPT CACHE SUMMARY\n");
+        out.push_str(&format!("├── Session ID : {}\n", sid));
+        out.push_str(&format!("├── Provider   : {} ({})\n", self.provider, self.model));
+        out.push_str(&format!("├── Mechanism  : {}\n", self.cache_mechanism()));
+        out.push_str(&format!("├── Status     : {}\n", self.cache_status()));
+        out.push_str(&format!("├── Hit Rate   : {:.2}%\n", self.cache_hit_rate()));
+        out.push_str(&format!("├── Cached     : {} ({} tokens)\n", crate::ui::statusline::fmt_tokens(self.total_cached_input_tokens), self.total_cached_input_tokens));
+        out.push_str(&format!("├── Uncached   : {} ({} tokens)\n", crate::ui::statusline::fmt_tokens(self.uncached_input_tokens()), self.uncached_input_tokens()));
+        out.push_str(&format!("└── Total In   : {} ({} tokens)\n\n", crate::ui::statusline::fmt_tokens(self.total_input_tokens), self.total_input_tokens));
+
+        out.push_str("RECENT CACHE DIAGNOSTICS (last 10):\n");
+        if self.cache_diagnostics.is_empty() {
+            out.push_str("  (no request recorded yet)\n");
+        } else {
+            for entry in self.cache_diagnostics.iter().rev().take(10).rev() {
+                let status_str = if entry.hit { "HIT " } else { "MISS" };
+                out.push_str(&format!(
+                    "  [Req #{:<2}] {} | Cached: {:<6} | In: {:<6} | {}\n",
+                    entry.req_index,
+                    status_str,
+                    entry.cached_tokens,
+                    entry.input_tokens,
+                    entry.note
+                ));
+            }
+        }
+        out
+    }
+
+    /// Menghitung sidik jari (hash) prefix untuk memverifikasi stabilitas KV Cache
+    pub fn update_prefix_guard(&mut self, preamble: &str) -> bool {
+        use std::hash::{DefaultHasher, Hasher};
+        let mut hasher = DefaultHasher::new();
+        hasher.write(preamble.as_bytes());
+        let current_hash = hasher.finish();
+
+        if self.prefix_hash == 0 {
+            // Giliran pertama: simpan sidik jari awal
+            self.prefix_hash = current_hash;
+            true
+        } else {
+            // Giliran berikutnya: bandingkan apakah prefix bergeser
+            self.prefix_hash == current_hash
+        }
+    }
+
+    /// Read the current git branch for `dir`, or `None` outside a repo / on a
+    /// detached HEAD (then a short commit hash is returned instead). Reads
+    /// `.git/HEAD` directly (cheap) rather than spawning git, and follows the
+    /// `.git` file pointer used by worktrees and submodules.
+    pub fn detect_git_branch(dir: &str) -> Option<CompactString> {
+        use std::path::{Path, PathBuf};
+        let dir_path = Path::new(dir);
+        let dot_git = dir_path.join(".git");
+        let gitdir = if dot_git.is_dir() {
+            dot_git
+        } else if dot_git.is_file() {
+            let content = std::fs::read_to_string(&dot_git).ok()?;
+            let rel = content.strip_prefix("gitdir:")?.trim();
+            let p = PathBuf::from(rel);
+            if p.is_absolute() { p } else { dir_path.join(p) }
+        } else {
+            return None;
+        };
+        let head = std::fs::read_to_string(gitdir.join("HEAD")).ok()?;
+        let head = head.trim();
+        if let Some(rest) = head.strip_prefix("ref:") {
+            let r = rest.trim();
+            Some(CompactString::new(
+                r.strip_prefix("refs/heads/").unwrap_or(r),
+            ))
+        } else if !head.is_empty() {
+            // Detached HEAD: show a short commit hash (char-boundary-safe).
+            let mut end = head.len().min(8);
+            while end > 0 && !head.is_char_boundary(end) {
+                end -= 1;
+            }
+            Some(CompactString::new(&head[..end]))
+        } else {
+            None
+        }
+    }
+
+    /// Refresh [`git_branch`](Self::git_branch) from the current `working_dir`.
+    pub fn refresh_git_branch(&mut self) {
+        self.git_branch = Self::detect_git_branch(&self.working_dir);
+    }
+
+    /// Async variant that runs the blocking `git status` on the blocking pool.
+    pub async fn refresh_git_branch_async(&mut self) {
+        let dir = self.working_dir.to_string();
+        let branch = tokio::task::spawn_blocking(move || Self::detect_git_branch(&dir))
+            .await
+            .ok()
+            .flatten();
+        self.git_branch = branch;
+    }
+
+    /// Refresh [`git_status`](Self::git_status) by running `git status` in
+    /// `working_dir`. Only call this when the statusline actually shows a git
+    /// change/status item: it spawns a subprocess (throttled by the caller).
+    #[allow(dead_code)]
+    pub fn refresh_git_status(&mut self) {
+        self.git_status = Self::detect_git_status(&self.working_dir);
+    }
+
+    /// Async variant that runs the blocking `git status` on the blocking pool.
+    pub async fn refresh_git_status_async(&mut self) {
+        let dir = self.working_dir.to_string();
+        let status = tokio::task::spawn_blocking(move || Self::detect_git_status(&dir))
+            .await
+            .ok()
+            .flatten();
+        self.git_status = status;
+    }
+
+    fn detect_git_status(dir: &str) -> Option<GitStatus> {
+        let out = std::process::Command::new("git")
+            .args(["status", "--porcelain=v2", "--branch"])
+            .current_dir(dir)
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        Some(Self::parse_porcelain(&String::from_utf8_lossy(&out.stdout)))
+    }
+
+    /// Parse `git status --porcelain=v2 --branch` output into a [`GitStatus`].
+    pub fn parse_porcelain(text: &str) -> GitStatus {
+        let mut s = GitStatus::default();
+        for line in text.lines() {
+            if let Some(ab) = line.strip_prefix("# branch.ab ") {
+                // Format: "+<ahead> -<behind>"
+                for tok in ab.split_whitespace() {
+                    if let Some(n) = tok.strip_prefix('+') {
+                        s.ahead = n.parse().unwrap_or(0);
+                    } else if let Some(n) = tok.strip_prefix('-') {
+                        s.behind = n.parse().unwrap_or(0);
+                    }
+                }
+            } else if let Some(rest) = line.strip_prefix("1 ").or_else(|| line.strip_prefix("2 ")) {
+                // Changed/renamed entry. The XY field is the first token: index
+                // status (staged) then worktree status.
+                if let Some(xy) = rest.split_whitespace().next() {
+                    let mut chars = xy.chars();
+                    let x = chars.next().unwrap_or('.');
+                    let y = chars.next().unwrap_or('.');
+                    if x != '.' {
+                        s.staged += 1;
+                    }
+                    match y {
+                        'M' => s.modified += 1,
+                        'D' => s.deleted += 1,
+                        _ => {}
+                    }
+                }
+            } else if line.starts_with("u ") {
+                // Unmerged paths count as a working-tree modification.
+                s.modified += 1;
+            } else if line.starts_with("? ") {
+                s.untracked += 1;
+            }
+        }
+        s
+    }
+
+    pub fn add_message(&mut self, role: MessageRole, content: &str) {
+        self.add_message_with_tool(role, content, None);
+    }
+
+    fn add_message_with_tool(
+        &mut self,
+        role: MessageRole,
+        content: &str,
+        tool: Option<ToolRecord>,
+    ) {
+        let tokens = Self::estimate_tokens(content);
+        self.messages.push(SessionMessage {
+            role,
+            content: CompactString::new(content),
+            estimated_tokens: tokens,
+            tool,
+        });
+        self.total_estimated_tokens = self.total_estimated_tokens.saturating_add(tokens);
+        self.updated_at = CompactString::new(chrono::Utc::now().to_rfc3339());
+        // The conversation has moved forward, so the last rewind's restore point
+        // no longer lines up — drop it so /redo can't splice in a stale tail.
+        self.rewind_undo = None;
+    }
+
+    /// Records the tool call with a structured `ToolRecord::Call` (complete,
+    /// untruncated args) alongside the existing display summary in `content`,
+    /// and returns the stamped id so the caller can link the matching result
+    /// via [`add_tool_result`](Self::add_tool_result).
+    pub fn add_tool_call(&mut self, name: &str, args: &serde_json::Value) -> u64 {
+        let id = self.next_tool_call_id;
+        self.next_tool_call_id = self.next_tool_call_id.saturating_add(1);
+        let content = crate::ui::utils::format_tool_call_summary(name, args);
+        self.add_message_with_tool(
+            MessageRole::ToolCall,
+            &content,
+            Some(ToolRecord::Call {
+                id,
+                name: CompactString::new(name),
+                args: args.clone(),
+            }),
+        );
+        id
+    }
+
+    /// Records the tool result. `call_id` must be the id returned by the
+    /// [`add_tool_call`](Self::add_tool_call) this result answers, so the
+    /// structured record links the two by id rather than by position (see
+    /// design.md decision 3). The result text itself is never duplicated: it
+    /// stays solely in the returned/`content` string, under the existing
+    /// threshold and overflow-file mechanism.
+    pub fn add_tool_result(&mut self, call_id: u64, name: &str, output: &str) -> String {
+        let (content, truncated, full_output_path) = self.tool_result_content(name, output);
+        self.add_message_with_tool(
+            MessageRole::ToolResult,
+            &content,
+            Some(ToolRecord::Result {
+                call_id,
+                name: CompactString::new(name),
+                truncated,
+                full_output_path: full_output_path.map(CompactString::new),
+            }),
+        );
+        content
+    }
+
+    fn tool_result_content(&self, name: &str, output: &str) -> (String, bool, Option<String>) {
+        let output_chars = output.chars().count();
+        if output_chars <= TOOL_RESULT_SAVE_THRESHOLD {
+            return (format!("{name}:\n{output}"), false, None);
+        }
+
+        match storage::save_tool_output(&self.id, name, output) {
+            Ok(path) => (
+                format_truncated_tool_result(name, output, output_chars, &path),
+                true,
+                Some(path.display().to_string()),
+            ),
+            Err(err) => (
+                format!(
+                    "{name}:\n{output}\n\n[failed to save long tool output separately; kept full output in session to avoid data loss: {err}]"
+                ),
+                false,
+                None,
+            ),
+        }
+    }
+
+    /// Records a subagent's tool call with a structured
+    /// [`ToolRecord::SubagentCall`] (complete, untruncated args) alongside the
+    /// existing display summary in `content`. `parent_call_id` is the id of
+    /// the enclosing `task` call — the value [`add_tool_call`](Self::add_tool_call)
+    /// returned for it — which is what attributes the subagent's activity to
+    /// the call that spawned it; subagent events are concurrent with the main
+    /// agent's turn, so position alone cannot express that link.
+    ///
+    /// `None` means the caller had no enclosing call in flight, which the
+    /// event ordering makes unreachable in practice (a subagent only runs
+    /// inside a `task` call). It degrades to the pre-existing behavior of a
+    /// display summary with no structured record, rather than fabricating a
+    /// parent id that would silently point at an unrelated call.
+    #[cfg(any(feature = "subagents", feature = "acp"))]
+    pub fn add_subagent_tool_call(
+        &mut self,
+        parent_call_id: Option<u64>,
+        name: &str,
+        args: &serde_json::Value,
+    ) {
+        let content = crate::ui::utils::format_tool_call_summary(name, args);
+        self.add_message_with_tool(
+            MessageRole::SubagentToolCall,
+            &content,
+            parent_call_id.map(|parent_call_id| ToolRecord::SubagentCall {
+                parent_call_id,
+                name: CompactString::new(name),
+                args: args.clone(),
+            }),
+        );
+    }
+
+    #[cfg(feature = "multimodal")]
+    pub fn drain_media(&mut self) -> Vec<crate::extras::multimodal::MediaAttachment> {
+        std::mem::take(&mut self.pending_media)
+    }
+
+    /// The true prompt size occupying the context window, normalizing across
+    /// providers' differing cache-usage reporting.
+    ///
+    /// The Anthropic-native route reports `input_tokens` counting *only* the
+    /// uncached portion of the prompt; the cache-read and cache-creation tokens
+    /// are reported in separate fields even though they still occupy the context
+    /// window. So there the real prompt size is the sum of all three. The
+    /// OpenAI, Gemini and OpenRouter shapes instead fold the cached subset into
+    /// `input_tokens` and report no cache-creation, so `input_tokens` is already
+    /// the full prompt size and adding the cache fields would double-count.
+    ///
+    /// `anthropic_native` must be the *resolved protocol route*, not a literal
+    /// provider-name comparison — a custom gateway with `provider_type =
+    /// "anthropic"` uses the native route under a different name, while
+    /// OpenRouter serving a Claude model does not. Compute it with
+    /// [`Config::is_anthropic_native`](crate::config::Config::is_anthropic_native).
+    pub fn real_input_tokens(
+        anthropic_native: bool,
+        input_tokens: u64,
+        cached_input_tokens: u64,
+        cache_creation_input_tokens: u64,
+    ) -> u64 {
+        if anthropic_native {
+            input_tokens
+                .saturating_add(cached_input_tokens)
+                .saturating_add(cache_creation_input_tokens)
+        } else {
+            input_tokens
+        }
+    }
+
+    pub fn set_calibration(&mut self, input_tokens: u64, output_tokens: u64) {
+        if input_tokens == 0 {
+            return;
+        }
+        self.calibrated_tokens = input_tokens.saturating_add(output_tokens);
+        self.calibrated_msg_count = self.messages.len();
+    }
+
+    pub fn reset_calibration(&mut self) {
+        self.calibrated_tokens = 0;
+        self.calibrated_msg_count = 0;
+    }
+
+    /// Truncate the conversation to `new_len` messages while keeping the context
+    /// figure accurate (used by `/undo` and the failed-send rollback).
+    ///
+    /// If any removed message was part of the calibration anchor, subtract its
+    /// estimated tokens from the anchor rather than discarding the whole
+    /// calibration. Resetting to a cold estimate would undercount (the estimate
+    /// omits tool schemas), and leaving the anchor untouched would overcount by
+    /// the removed turn — subtracting keeps the figure ≈ the real remaining
+    /// size. Messages beyond the anchor were never in it, so removing them only
+    /// shrinks the estimated tail.
+    pub fn truncate_to(&mut self, new_len: usize) {
+        if new_len >= self.messages.len() {
+            return;
+        }
+        let cal = self.calibrated_msg_count.min(self.messages.len());
+        if self.calibrated_tokens > 0 && new_len < cal {
+            let removed: u64 = self.messages[new_len..cal]
+                .iter()
+                .map(|m| m.estimated_tokens)
+                .sum();
+            self.calibrated_tokens = self.calibrated_tokens.saturating_sub(removed);
+            self.calibrated_msg_count = new_len;
+        }
+        self.messages.truncate(new_len);
+        self.total_estimated_tokens = self.messages.iter().map(|m| m.estimated_tokens).sum();
+    }
+
+    /// Rewind the conversation to `new_len` messages, capturing a single-step
+    /// restore point first so the cut can be undone with [`redo`](Self::redo).
+    ///
+    /// This is the shared primitive behind both `/undo` (rewind by one turn) and
+    /// the double-Esc rewind picker (rewind to a chosen earlier point): the only
+    /// difference between them is which `new_len` they pass. Returns the number
+    /// of messages removed (0 if `new_len` is already at or past the end, in
+    /// which case no restore point is recorded).
+    pub fn rewind_to(&mut self, new_len: usize) -> usize {
+        if new_len >= self.messages.len() {
+            return 0;
+        }
+        let removed = self.messages.len() - new_len;
+        self.rewind_undo = Some(RewindUndo {
+            messages: self.messages.clone(),
+            total_estimated_tokens: self.total_estimated_tokens,
+            calibrated_tokens: self.calibrated_tokens,
+            calibrated_msg_count: self.calibrated_msg_count,
+        });
+        self.truncate_to(new_len);
+        removed
+    }
+
+    /// Restore the messages removed by the most recent [`rewind_to`](Self::rewind_to)
+    /// (i.e. the last `/undo` or rewind). Returns false when there is nothing to
+    /// restore. The restore point is consumed, and is also invalidated as soon
+    /// as the conversation moves forward again (see [`add_message`](Self::add_message)),
+    /// so `/redo` only ever reaches back to the cut it directly reverses.
+    pub fn redo(&mut self) -> bool {
+        match self.rewind_undo.take() {
+            Some(u) => {
+                self.messages = u.messages;
+                self.total_estimated_tokens = u.total_estimated_tokens;
+                self.calibrated_tokens = u.calibrated_tokens;
+                self.calibrated_msg_count = u.calibrated_msg_count;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// True while the context figure is still an estimate — no provider usage
+    /// has been reported yet (or it was reset by `/clear`). The status bar marks
+    /// the estimated value so the snap to the real number on the first response
+    /// reads as a refinement rather than a surprise.
+    pub fn ctx_is_estimated(&self) -> bool {
+        self.calibrated_tokens == 0
+    }
+
+    pub fn effective_context_tokens(&self) -> u64 {
+        if self.calibrated_tokens == 0 {
+            // No real usage yet: per-message estimates cover only `messages`, so
+            // add the fixed overhead (system prompt, tools, context files) that
+            // every request also carries. After calibration this overhead is
+            // already inside the anchor, so it is not added in that branch.
+            return self
+                .overhead_tokens
+                .saturating_add(self.total_estimated_tokens);
+        }
+        let start = self.calibrated_msg_count.min(self.messages.len());
+        let delta: u64 = self.messages[start..]
+            .iter()
+            .map(|m| m.estimated_tokens)
+            .sum();
+        self.calibrated_tokens.saturating_add(delta)
+    }
+
+    /// Pick the compaction boundary: `messages[..cut]` get summarized and
+    /// `messages[cut..]` are kept as recent context. Walks backward summing
+    /// per-message `estimated_tokens` until `keep_recent` is covered.
+    ///
+    /// This deliberately stays in the per-message estimate scale rather than
+    /// the calibrated total: it is a *relative* comparison among messages (how
+    /// far back does `keep_recent` reach), so any uniform estimator bias
+    /// cancels out. Calibration only matters for the absolute total in
+    /// `effective_context_tokens`.
+    ///
+    /// Returns 0 ("nothing old enough to summarize") when every message fits
+    /// within `keep_recent`. The initial value is 0, not `messages.len()`, so
+    /// an oversized `keep_recent` keeps the recent messages instead of
+    /// summarizing the entire history, a case made reachable now that the
+    /// compaction gate measures context against real usage (system prompt and
+    /// context files can push the real total over budget while the messages
+    /// themselves stay small).
+    pub fn select_compaction_cut(messages: &[SessionMessage], keep_recent: u64) -> usize {
+        let mut accumulated = 0u64;
+        let mut cut_idx = 0;
+        for (i, msg) in messages.iter().enumerate().rev() {
+            if accumulated >= keep_recent {
+                cut_idx = i + 1;
+                break;
+            }
+            accumulated = accumulated.saturating_add(msg.estimated_tokens);
+        }
+        cut_idx
+    }
+
+    pub fn needs_compaction(&self, reserve_tokens: u64) -> bool {
+        if self.context_window == 0 {
+            return false;
+        }
+        self.effective_context_tokens() > self.context_window.saturating_sub(reserve_tokens)
+    }
+
+    pub fn update_context_window(&mut self, cw: u64) {
+        self.context_window = cw;
+    }
+
+    pub fn compacted_context(&self) -> (Option<&str>, usize) {
+        let c = match self.compactions.last() {
+            Some(c) => c,
+            None => return (None, 0),
+        };
+        // Locate the summary System message at runtime rather than trusting
+        // a stored index, which drifts if messages are inserted before it.
+        for (i, msg) in self.messages.iter().enumerate() {
+            if msg.role == MessageRole::System && msg.content.as_str() == c.summary.as_str() {
+                return (Some(c.summary.as_str()), i + 1);
+            }
+        }
+        (None, 0)
+    }
+
+    pub fn compress(&mut self, summary: String, first_kept_index: usize, token_savings: u64) {
+        let summarized_count = first_kept_index;
+        let summary_tokens = Self::estimate_tokens(&summary);
+
+        // Insert a System message with the summary at the boundary
+        let summary_msg = SessionMessage {
+            role: MessageRole::System,
+            content: CompactString::from(summary.clone()),
+            estimated_tokens: summary_tokens,
+            tool: None,
+        };
+
+        // Remove summarized messages and insert summary
+        self.messages.drain(..first_kept_index);
+        self.messages.insert(0, summary_msg);
+
+        // Recompute total from remaining messages so the count is always
+        // consistent — no underflow risk when token_savings is stale.
+        self.total_estimated_tokens = self.messages.iter().map(|m| m.estimated_tokens).sum();
+
+        self.compactions.push(Compaction {
+            summary: CompactString::from(summary),
+            first_kept_index: 1, // The summary is at index 0
+            summarized_count,
+            token_savings,
+            created_at: CompactString::new(chrono::Utc::now().to_rfc3339()),
+        });
+
+        // Compaction reindexes messages, so the calibration anchor no longer
+        // lines up. Drop it; the next completed turn re-anchors.
+        self.reset_calibration();
+        self.updated_at = CompactString::new(chrono::Utc::now().to_rfc3339());
+    }
+}
+
+fn format_truncated_tool_result(
+    name: &str,
+    output: &str,
+    output_chars: usize,
+    path: &Path,
+) -> String {
+    // Avoid double O(n) char iteration + temporary String allocs for head/tail
+    // by slicing via byte indices found with char_indices.
+    let head_end = output
+        .char_indices()
+        .nth(TOOL_RESULT_HEAD_CHARS)
+        .map(|(i, _)| i)
+        .unwrap_or(output.len());
+    let head = &output[..head_end];
+    let tail_start_char = output_chars.saturating_sub(TOOL_RESULT_TAIL_CHARS);
+    let tail_start = output
+        .char_indices()
+        .nth(tail_start_char)
+        .map(|(i, _)| i)
+        .unwrap_or(output.len());
+    let tail = &output[tail_start..];
+    let omitted = output_chars.saturating_sub(TOOL_RESULT_HEAD_CHARS + TOOL_RESULT_TAIL_CHARS);
+
+    format!(
+        "{name}:\n{head}\n\n[tool output truncated: {output_chars} characters; {omitted} omitted]\n[full output saved to: {}; use the read tool on this path to inspect the complete output]\n\n{tail}",
+        path.display()
+    )
 }

@@ -353,10 +353,13 @@ pub(crate) fn inject_session_id_extra_body(
 ) -> Option<serde_json::Value> {
     let sid = active_session_id()?;
     let session_val = if is_openrouter {
-        // OpenRouter menerima session_id & user
+        // OpenRouter: kirim session_id & user untuk sticky routing,
+        // serta "transforms": [] untuk mencegah OpenRouter memotong prompt (middle-out)
+        // yang dapat merusak prefix KV Cache.
         serde_json::json!({
             "session_id": sid,
             "user": sid,
+            "transforms": [],
         })
     } else {
         // Standar OpenAI untuk NVIDIA NIM, vLLM, dan generic provider:
