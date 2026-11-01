@@ -349,12 +349,21 @@ pub(crate) fn merge_extra_body(
 /// - "user": parameter standar OpenAI/vLLM/NIM untuk pelacakan konteks user.
 pub(crate) fn inject_session_id_extra_body(
     extra: Option<serde_json::Value>,
+    is_openrouter: bool,
 ) -> Option<serde_json::Value> {
     let sid = active_session_id()?;
-    let session_val = serde_json::json!({
-        "session_id": sid,
-        "user": sid,
-    });
+    let session_val = if is_openrouter {
+        // OpenRouter menerima session_id & user
+        serde_json::json!({
+            "session_id": sid,
+            "user": sid,
+        })
+    } else {
+        // Standar OpenAI untuk NVIDIA NIM, vLLM, dan generic provider:
+        serde_json::json!({
+            "user": sid,
+        })
+    };
     merge_extra_body(Some(session_val), extra)
 }
 
@@ -1535,42 +1544,51 @@ async fn build_openai_agent(model: OpenAiModel, build: AgentBuild<'_>) -> OpenAi
 }
 
 pub async fn build_agent(model: AnyModel, mut build: AgentBuild<'_>) -> AnyAgent {
-    // Otomatis pasang session ID ke semua agent
-    build.extra_body = inject_session_id_extra_body(build.extra_body);
-
     match model {
         AnyModel::OpenRouter(m) => {
             let mut build = build;
+            build.extra_body = inject_session_id_extra_body(build.extra_body, true); // true untuk OpenRouter
             build.extra_body = merge_extra_body(m.extra, build.extra_body);
             AnyAgent::OpenRouter(builder::build_agent_inner(m.model, build).await)
         }
-        AnyModel::OpenAI(m) => AnyAgent::OpenAI(build_openai_agent(m, build).await),
+        AnyModel::OpenAI(m) => {
+            // false untuk NVIDIA NIM / OpenAI (hanya kirim "user", bebas error 400!)
+            build.extra_body = inject_session_id_extra_body(build.extra_body, false);
+            AnyAgent::OpenAI(build_openai_agent(m, build).await)
+        }
         AnyModel::Anthropic(m) => AnyAgent::Anthropic(builder::build_agent_inner(m, build).await),
         AnyModel::Gemini(m) => AnyAgent::Gemini(builder::build_agent_inner(m, build).await),
-        AnyModel::Ollama(m) => AnyAgent::Ollama(builder::build_agent_inner(m, build).await),
+        AnyModel::Ollama(m) => {
+            build.extra_body = inject_session_id_extra_body(build.extra_body, false);
+            AnyAgent::Ollama(builder::build_agent_inner(m, build).await)
+        }
     }
 }
 
 pub fn build_btw_agent(model: AnyModel, mut build: AgentBuild<'_>) -> AnyAgent {
-    // Otomatis pasang session ID ke agent /btw
-    build.extra_body = inject_session_id_extra_body(build.extra_body);
-
     match model {
         AnyModel::OpenRouter(m) => {
             let mut build = build;
+            build.extra_body = inject_session_id_extra_body(build.extra_body, true);
             build.extra_body = merge_extra_body(m.extra, build.extra_body);
             AnyAgent::OpenRouter(builder::build_btw_agent_inner(m.model, build))
         }
-        AnyModel::OpenAI(m) => AnyAgent::OpenAI(match m {
-            OpenAiModel::Responses(m) => {
-                OpenAiAgent::Responses(builder::build_btw_agent_inner(m, build))
-            }
-            OpenAiModel::Completions(m) => {
-                OpenAiAgent::Completions(builder::build_btw_agent_inner(m, build))
-            }
-        }),
+        AnyModel::OpenAI(m) => {
+            build.extra_body = inject_session_id_extra_body(build.extra_body, false);
+            AnyAgent::OpenAI(match m {
+                OpenAiModel::Responses(m) => {
+                    OpenAiAgent::Responses(builder::build_btw_agent_inner(m, build))
+                }
+                OpenAiModel::Completions(m) => {
+                    OpenAiAgent::Completions(builder::build_btw_agent_inner(m, build))
+                }
+            })
+        }
         AnyModel::Anthropic(m) => AnyAgent::Anthropic(builder::build_btw_agent_inner(m, build)),
         AnyModel::Gemini(m) => AnyAgent::Gemini(builder::build_btw_agent_inner(m, build)),
-        AnyModel::Ollama(m) => AnyAgent::Ollama(builder::build_btw_agent_inner(m, build)),
+        AnyModel::Ollama(m) => {
+            build.extra_body = inject_session_id_extra_body(build.extra_body, false);
+            AnyAgent::Ollama(builder::build_btw_agent_inner(m, build))
+        }
     }
 }
