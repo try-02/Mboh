@@ -29,7 +29,6 @@ pub async fn ensure_agent(
 ) {
     // Simpan sidik jari prefix awal
     let preamble = crate::agent::builder::build_preamble(ui.context, reasoning_enabled);
-    ui.session.update_prefix_guard(&preamble);
     if agent.is_some() {
         return;
     }
@@ -270,8 +269,7 @@ pub async fn handle_agent_event(
                 ui.session.total_cached_input_tokens.saturating_add(cached_input_tokens);
             ui.session.total_cache_creation_input_tokens =
                 ui.session.total_cache_creation_input_tokens.saturating_add(cache_creation_input_tokens);
-                let prefix_intact = ui.session.prefix_hash == 0 || true; // guard aktif
-            ui.session.record_cache_call(input_tokens, cached_input_tokens, prefix_intact);
+                ui.session.record_cache_call(input_tokens, cached_input_tokens);
 
             ui.session.total_cost += crate::pricing::estimate_cost(
                 crate::pricing::billable_input_tokens(
