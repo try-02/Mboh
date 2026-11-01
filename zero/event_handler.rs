@@ -258,23 +258,17 @@ pub async fn handle_agent_event(
                 ui.session.total_estimated_tokens = real;
             }
 
-            // 1. Akumulasi token input & output setiap kali request selesai
+            // Akumulasi token per-request secara real-time
             ui.session.total_input_tokens =
                 ui.session.total_input_tokens.saturating_add(input_tokens);
             ui.session.total_output_tokens =
                 ui.session.total_output_tokens.saturating_add(output_tokens);
+            ui.session.total_cached_input_tokens =
+                ui.session.total_cached_input_tokens.saturating_add(cached_input_tokens);
+            ui.session.total_cache_creation_input_tokens =
+                ui.session.total_cache_creation_input_tokens.saturating_add(cache_creation_input_tokens);
+                ui.session.record_cache_call(input_tokens, cached_input_tokens);
 
-            // 2. TAMBAHKAN INI agar cache tercatat di sesi (sebelumnya terlewat):
-            ui.session.total_cached_input_tokens = ui
-                .session
-                .total_cached_input_tokens
-                .saturating_add(cached_input_tokens);
-            ui.session.total_cache_creation_input_tokens = ui
-                .session
-                .total_cache_creation_input_tokens
-                .saturating_add(cache_creation_input_tokens);
-
-            // 3. Akumulasi biaya cost
             ui.session.total_cost += crate::pricing::estimate_cost(
                 crate::pricing::billable_input_tokens(
                     ui.cfg
@@ -288,7 +282,7 @@ pub async fn handle_agent_event(
                 ui.session.output_token_cost,
             );
 
-            // 4. Kalibrasi context meter langsung ke request terakhir (mencegah bug 41k)
+            // Kalibrasi konteks meter langsung menggunakan request terakhir
             let real_input = Session::real_input_tokens(
                 ui.cfg
                     .is_anthropic_native(&ui.session.provider, &ui.session.model),

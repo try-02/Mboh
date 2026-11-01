@@ -43,6 +43,12 @@ jobs:
               cp Mboh/zero/event_handler.rs zerostack/src/ui/ && \
               cp Mboh/zero/statusline.rs zerostack/src/ui/ && \
               cp Mboh/zero/provider.rs zerostack/src/ && \
+              cp Mboh/zero/mod.rs zerostack/src/session/ && \
+              cp Mboh/zero/emod.rs zerostack/src/engine/mod.rs && \
+              cp Mboh/zero/list.rs zerostack/src/ui/pickers/ && \
+              cp Mboh/zero/help.rs zerostack/src/ui/slash/ && \
+              cp Mboh/zero/smod.rs zerostack/src/ui/slash/mod.rs && \
+              cp Mboh/zero/session.rs zerostack/src/ui/slash/ && \
               cd zerostack && \
 
               # 3. Vendor dependencies ke folder lokal
