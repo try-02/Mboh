@@ -304,8 +304,8 @@ impl Session {
         self.total_input_tokens.saturating_sub(self.total_cached_input_tokens)
     }
 
-    /// Menghitung persentase efisiensi cache (Cache Hit Rate)
-    pub fn cache_hit_rate(&self) -> f64 {
+    /// Menghitung persentase token input yang berhasil di-cache (Token Cache Rate)
+    pub fn token_cache_rate(&self) -> f64 {
         if self.total_input_tokens == 0 {
             0.0
         } else {
@@ -313,7 +313,22 @@ impl Session {
         }
     }
 
-    /// Status keaktifan prompt/KV caching dari laporan provider
+    /// Alias untuk statusline agar tetap kompatibel
+    pub fn cache_hit_rate(&self) -> f64 {
+        self.token_cache_rate()
+    }
+
+    /// Menghitung persentase request API yang memperoleh cache hit (Request Hit Rate)
+    pub fn request_hit_rate(&self) -> f64 {
+        if self.cache_diagnostics.is_empty() {
+            0.0
+        } else {
+            let hit_count = self.cache_diagnostics.iter().filter(|d| d.hit).count();
+            (hit_count as f64 * 100.0) / self.cache_diagnostics.len() as f64
+        }
+    }
+
+    /// Status deteksi cache berdasarkan laporan provider
     pub fn cache_status(&self) -> &'static str {
         if self.total_cached_input_tokens > 0 {
             "ACTIVE"
@@ -324,21 +339,21 @@ impl Session {
         }
     }
 
-    /// Mendeteksi mekanisme caching berdasarkan provider & model aktif
+    /// Identifikasi mekanisme caching yang akurat dan berbasis bukti
     pub fn cache_mechanism(&self) -> &'static str {
         let prov = self.provider.to_lowercase();
         let mdl = self.model.to_lowercase();
 
         if prov.contains("openrouter") {
-            "OpenRouter (Sticky Routing + Prefix Cache)"
+            "Sticky Routing + Prompt Cache"
         } else if prov.contains("nvidia") || mdl.contains("nemotron") || prov.contains("nvcap") {
-            "NVIDIA NIM / vLLM (Prefix Block Paging)"
+            "NVIDIA API (Provider Prompt Cache)"
         } else if prov.contains("anthropic") || mdl.contains("claude") {
             "Anthropic (Prompt Cache Breakpoints)"
         } else if prov.contains("openai") || mdl.contains("gpt") {
-            "OpenAI (Automatic Prompt Caching)"
+            "OpenAI (Automatic Prompt Cache)"
         } else {
-            "Generic Prefix Caching"
+            "Provider-reported Prompt Cache"
         }
     }
 
@@ -367,34 +382,47 @@ impl Session {
         });
     }
 
-    /// Menghasilkan teks laporan diagnosa pohon untuk perintah /cache
+    /// Format laporan /cache baru sesuai spesifikasi diagnostik presisi
     pub fn format_cache_report(&self) -> String {
         let mut out = String::new();
-        let sid = if self.id.len() >= 8 { &self.id[..8] } else { &self.id };
-        out.push_str("KV / PROMPT CACHE SUMMARY\n");
-        out.push_str(&format!("├── Session ID : {}\n", sid));
-        out.push_str(&format!("├── Provider   : {} ({})\n", self.provider, self.model));
-        out.push_str(&format!("├── Mechanism  : {}\n", self.cache_mechanism()));
-        out.push_str(&format!("├── Status     : {}\n", self.cache_status()));
-        out.push_str(&format!("├── Hit Rate   : {:.2}%\n", self.cache_hit_rate()));
-        out.push_str(&format!("├── Cached     : {} ({} tokens)\n", crate::ui::statusline::fmt_tokens(self.total_cached_input_tokens), self.total_cached_input_tokens));
-        out.push_str(&format!("├── Uncached   : {} ({} tokens)\n", crate::ui::statusline::fmt_tokens(self.uncached_input_tokens()), self.uncached_input_tokens()));
-        out.push_str(&format!("└── Total In   : {} ({} tokens)\n\n", crate::ui::statusline::fmt_tokens(self.total_input_tokens), self.total_input_tokens));
 
-        out.push_str("RECENT CACHE DIAGNOSTICS (last 10):\n");
-        if self.cache_diagnostics.is_empty() {
-            out.push_str("  (no request recorded yet)\n");
+        out.push_str("KV / PROMPT CACHE SUMMARY\n\n");
+        // Tampilkan Full UUID sesi asli Zerostack:
+        out.push_str(&format!("Session ID : {}\n", self.id));
+        out.push_str(&format!("Provider   : {}\n", self.provider));
+        out.push_str(&format!("Model      : {}\n\n", self.model));
+
+        out.push_str("CACHE STATUS\n");
+        out.push_str(&format!("├── Status            : {}\n", self.cache_status()));
+        out.push_str(&format!("├── Mechanism         : {}\n", self.cache_mechanism()));
+        out.push_str(&format!("├── Cached Tokens     : {}\n", fmt_comma(self.total_cached_input_tokens)));
+        out.push_str(&format!("├── Uncached Tokens   : {}\n", fmt_comma(self.uncached_input_tokens())));
+        out.push_str(&format!("├── Total Input       : {}\n", fmt_comma(self.total_input_tokens)));
+        out.push_str(&format!("├── Token Cache Rate  : {:.2}%\n", self.token_cache_rate()));
+        out.push_str(&format!("└── Request Hit Rate  : {:.2}%\n\n", self.request_hit_rate()));
+
+        out.push_str("RECENT DIAGNOSTICS\n");
+        let entries: Vec<_> = self.cache_diagnostics.iter().rev().take(10).rev().collect();
+        if entries.is_empty() {
+            out.push_str("└── (no requests recorded yet)\n");
         } else {
-            for entry in self.cache_diagnostics.iter().rev().take(10).rev() {
-                let status_str = if entry.hit { "HIT " } else { "MISS" };
-                out.push_str(&format!(
-                    "  [Req #{:<2}] {} | Cached: {:<6} | In: {:<6} | {}\n",
-                    entry.req_index,
-                    status_str,
-                    entry.cached_tokens,
-                    entry.input_tokens,
-                    entry.note
-                ));
+            let total = entries.len();
+            for (idx, entry) in entries.iter().enumerate() {
+                let branch = if idx == total - 1 { "└── " } else { "├── " };
+                if entry.hit {
+                    out.push_str(&format!(
+                        "{}Request #{:<2} : HIT ({})\n",
+                        branch,
+                        entry.req_index,
+                        fmt_comma(entry.cached_tokens)
+                    ));
+                } else {
+                    out.push_str(&format!(
+                        "{}Request #{:<2} : MISS\n",
+                        branch,
+                        entry.req_index
+                    ));
+                }
             }
         }
         out
@@ -918,4 +946,18 @@ fn format_truncated_tool_result(
         "{name}:\n{head}\n\n[tool output truncated: {output_chars} characters; {omitted} omitted]\n[full output saved to: {}; use the read tool on this path to inspect the complete output]\n\n{tail}",
         path.display()
     )
+}
+
+/// Helper pemformat angka dengan pemisah koma ribuan (contoh: 11,787)
+fn fmt_comma(n: u64) -> String {
+    let s = n.to_string();
+    let mut out = String::new();
+    let len = s.len();
+    for (i, c) in s.chars().enumerate() {
+        if i > 0 && (len - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
 }
