@@ -370,7 +370,7 @@ fn save_session_if_enabled(
 
 async fn handle_agent_done(
     response: CompactString,
-    usage: TurnUsage,
+    _usage: TurnUsage,
     renderer: &mut Renderer,
     run: &mut AgentRunState,
     ui: &mut UiContext<'_>,

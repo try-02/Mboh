@@ -596,6 +596,12 @@ impl Session {
         self.rewind_undo = None;
     }
 
+    /// Method bawaan lama (tetap dipertahankan agar tidak error di engine/startup/event_handler)
+    pub fn add_tool_call(&mut self, name: &str, args: &serde_json::Value) -> u64 {
+        self.add_tool_call_with_raw_id(None, name, args)
+    }
+
+    /// Method baru yang mendukung penyimpanan string ID asli dari provider
     pub fn add_tool_call_with_raw_id(
         &mut self,
         raw_id: Option<&str>,
