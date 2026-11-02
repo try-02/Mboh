@@ -227,7 +227,9 @@ pub async fn handle_agent_event(
             output_tokens,
             cached_input_tokens,
             cache_creation_input_tokens,
+            history,
         } => {
+            ui.session.live_history = history;
             handle_agent_done(
                 response,
                 TurnUsage {

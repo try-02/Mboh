@@ -50,6 +50,8 @@ jobs:
               cp Mboh/zero/smod.rs zerostack/src/ui/slash/mod.rs && \
               cp Mboh/zero/session.rs zerostack/src/ui/slash/ && \
               cp Mboh/zero/src/agent/builder.rs zerostack/src/agent/ && \
+              cp Mboh/zero/event.rs zerostack/src/ && \
+              cp Mboh/zero/runner.rs zerostack/src/agent/ && \
               cd zerostack && \
 
               # 3. Vendor dependencies ke folder lokal

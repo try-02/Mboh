@@ -4,6 +4,7 @@ pub mod storage;
 use std::path::Path;
 
 use compact_str::CompactString;
+use rig::completion::Message;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -48,6 +49,8 @@ pub struct SessionMessage {
 pub enum ToolRecord {
     Call {
         id: u64,
+        #[serde(default)]
+        call_id_str: Option<CompactString>, // ID asli dari provider (misal: "call-13cad8b4...")
         name: CompactString,
         args: serde_json::Value,
     },
@@ -212,6 +215,8 @@ pub struct Session {
     /// [`rewind_to`](Self::rewind_to). Runtime only, not persisted.
     #[serde(skip)]
     pub rewind_undo: Option<RewindUndo>,
+    #[serde(skip)]
+    pub live_history: Vec<Message>,
 }
 
 /// Working-tree summary parsed from `git status --porcelain=v2 --branch`.
@@ -296,6 +301,7 @@ impl Session {
             reasoning_enabled: false,
             overhead_tokens: 0,
             rewind_undo: None,
+            live_history: Vec::new(),
         }
     }
 
@@ -328,32 +334,33 @@ impl Session {
         }
     }
 
-    /// Status deteksi cache berdasarkan laporan provider
-    pub fn cache_status(&self) -> &'static str {
+    /// Status sesi akumulatif
+    pub fn session_cache_status(&self) -> &'static str {
         if self.total_cached_input_tokens > 0 {
-            "ACTIVE"
+            "HIT OBSERVED"
         } else if self.total_input_tokens > 0 {
-            "MISS / INACTIVE"
+            "NO CACHE OBSERVED"
         } else {
             "STANDBY"
         }
     }
 
-    /// Identifikasi mekanisme caching yang akurat dan berbasis bukti
-    pub fn cache_mechanism(&self) -> &'static str {
-        let prov = self.provider.to_lowercase();
-        let mdl = self.model.to_lowercase();
+    /// Status hasil request paling terakhir
+    pub fn last_request_status(&self) -> String {
+        match self.cache_diagnostics.last() {
+            Some(last) if last.hit => format!("HIT ({})", fmt_comma(last.cached_tokens)),
+            Some(_) => "MISS".to_string(),
+            None => "STANDBY".to_string(),
+        }
+    }
 
-        if prov.contains("openrouter") {
+    /// Label Cache Source yang jujur dan berbasis bukti
+    pub fn cache_source_label(&self) -> &'static str {
+        let prov = self.provider.to_lowercase();
+        if prov.contains("openrouter") || prov.contains("opcap") {
             "Sticky Routing + Prompt Cache"
-        } else if prov.contains("nvidia") || mdl.contains("nemotron") || prov.contains("nvcap") {
-            "NVIDIA API (Provider Prompt Cache)"
-        } else if prov.contains("anthropic") || mdl.contains("claude") {
-            "Anthropic (Prompt Cache Breakpoints)"
-        } else if prov.contains("openai") || mdl.contains("gpt") {
-            "OpenAI (Automatic Prompt Cache)"
         } else {
-            "Provider-reported Prompt Cache"
+            "Provider-reported"
         }
     }
 
@@ -382,19 +389,18 @@ impl Session {
         });
     }
 
-    /// Format laporan /cache baru sesuai spesifikasi diagnostik presisi
     pub fn format_cache_report(&self) -> String {
         let mut out = String::new();
 
         out.push_str("KV / PROMPT CACHE SUMMARY\n\n");
-        // Tampilkan Full UUID sesi asli Zerostack:
         out.push_str(&format!("Session ID : {}\n", self.id));
         out.push_str(&format!("Provider   : {}\n", self.provider));
         out.push_str(&format!("Model      : {}\n\n", self.model));
 
         out.push_str("CACHE STATUS\n");
-        out.push_str(&format!("├── Status            : {}\n", self.cache_status()));
-        out.push_str(&format!("├── Mechanism         : {}\n", self.cache_mechanism()));
+        out.push_str(&format!("├── Session Cache     : {}\n", self.session_cache_status()));
+        out.push_str(&format!("├── Last Request      : {}\n", self.last_request_status()));
+        out.push_str(&format!("├── Cache Source      : {}\n", self.cache_source_label()));
         out.push_str(&format!("├── Cached Tokens     : {}\n", fmt_comma(self.total_cached_input_tokens)));
         out.push_str(&format!("├── Uncached Tokens   : {}\n", fmt_comma(self.uncached_input_tokens())));
         out.push_str(&format!("├── Total Input       : {}\n", fmt_comma(self.total_input_tokens)));
@@ -590,11 +596,12 @@ impl Session {
         self.rewind_undo = None;
     }
 
-    /// Records the tool call with a structured `ToolRecord::Call` (complete,
-    /// untruncated args) alongside the existing display summary in `content`,
-    /// and returns the stamped id so the caller can link the matching result
-    /// via [`add_tool_result`](Self::add_tool_result).
-    pub fn add_tool_call(&mut self, name: &str, args: &serde_json::Value) -> u64 {
+    pub fn add_tool_call_with_raw_id(
+        &mut self,
+        raw_id: Option<&str>,
+        name: &str,
+        args: &serde_json::Value,
+    ) -> u64 {
         let id = self.next_tool_call_id;
         self.next_tool_call_id = self.next_tool_call_id.saturating_add(1);
         let content = crate::ui::utils::format_tool_call_summary(name, args);
@@ -603,6 +610,7 @@ impl Session {
             &content,
             Some(ToolRecord::Call {
                 id,
+                call_id_str: raw_id.map(CompactString::new),
                 name: CompactString::new(name),
                 args: args.clone(),
             }),
@@ -759,6 +767,8 @@ impl Session {
         }
         self.messages.truncate(new_len);
         self.total_estimated_tokens = self.messages.iter().map(|m| m.estimated_tokens).sum();
+        // Bersihkan saat /undo agar kembali ke titik potong
+        self.live_history.clear();
     }
 
     /// Rewind the conversation to `new_len` messages, capturing a single-step
@@ -916,6 +926,8 @@ impl Session {
         // lines up. Drop it; the next completed turn re-anchors.
         self.reset_calibration();
         self.updated_at = CompactString::new(chrono::Utc::now().to_rfc3339());
+        // Bersihkan live history saat compaction agar digantikan summary
+        self.live_history.clear();
     }
 }
 

@@ -349,7 +349,9 @@ impl Engine {
                     output_tokens,
                     cached_input_tokens,
                     cache_creation_input_tokens,
+                    history,
                 } => {
+                    self.session.live_history = history;
                     usage = TurnUsage {
                         input_tokens,
                         output_tokens,
@@ -1528,13 +1530,6 @@ impl Engine {
         sink: &mut StringSink,
     ) -> anyhow::Result<SlashFlow> {
         match parts[0] {
-            "/cache" => {
-                let report = self.session.format_cache_report();
-                for line in report.lines() {
-                    sink.write_result(line);
-                }
-                Ok(SlashFlow::Done)
-            }
             "/sessions" => self.cmd_sessions(parts, sink),
             "/rename" => self.cmd_rename(parts, sink),
             "/clear" | "/new" => {
@@ -1825,7 +1820,6 @@ impl Engine {
         for line in [
             "  /add [path]            add file(s) to context",
             "  /drop <path>           remove file from context",
-            "  /cache                 show KV/prompt cache diagnostics",
             "  /clear                 clear session",
             "  /provider [name]       show or switch provider",
             "  /model [name]          show or switch model",
