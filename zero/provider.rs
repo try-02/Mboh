@@ -1555,15 +1555,8 @@ pub async fn build_agent(model: AnyModel, mut build: AgentBuild<'_>) -> AnyAgent
             AnyAgent::OpenRouter(builder::build_agent_inner(m.model, build).await)
         }
         AnyModel::OpenAI(m) => {
-            // Cek apakah provider custom menargetkan OpenRouter (misal: "opcap" atau base_url openrouter)
-            let is_openrouter_custom = build.cfg.custom_providers_map().iter().any(|(name, c)| {
-                name == "opcap" 
-                    || name.contains("openrouter") 
-                    || c.base_url.contains("openrouter.ai")
-            });
-
-            // Jika OpenRouter kirim session_id & user; jika NVIDIA/lainnya hanya kirim user
-            build.extra_body = inject_session_id_extra_body(build.extra_body, is_openrouter_custom);
+            // Standar OpenAI-compatible (NVIDIA NIM, vLLM, dll.) hanya mendukung parameter `user`
+            build.extra_body = inject_session_id_extra_body(build.extra_body, false);
             AnyAgent::OpenAI(build_openai_agent(m, build).await)
         }
         AnyModel::Anthropic(m) => AnyAgent::Anthropic(builder::build_agent_inner(m, build).await),
@@ -1584,12 +1577,8 @@ pub fn build_btw_agent(model: AnyModel, mut build: AgentBuild<'_>) -> AnyAgent {
             AnyAgent::OpenRouter(builder::build_btw_agent_inner(m.model, build))
         }
         AnyModel::OpenAI(m) => {
-            let is_openrouter_custom = build.cfg.custom_providers_map().iter().any(|(name, c)| {
-                name == "opcap" 
-                    || name.contains("openrouter") 
-                    || c.base_url.contains("openrouter.ai")
-            });
-            build.extra_body = inject_session_id_extra_body(build.extra_body, is_openrouter_custom);
+            // Standar OpenAI-compatible (NVIDIA NIM, vLLM, dll.) hanya mendukung parameter `user`
+            build.extra_body = inject_session_id_extra_body(build.extra_body, false);
             AnyAgent::OpenAI(match m {
                 OpenAiModel::Responses(m) => {
                     OpenAiAgent::Responses(builder::build_btw_agent_inner(m, build))
