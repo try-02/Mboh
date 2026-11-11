@@ -1,0 +1,88 @@
+# Bangun wheelhouse Hermes Agent (.[termux]) di Termux-Docker (aarch64).
+# Target: Python 3.14, tag android_24_arm64_v8a (sama dengan HP Anda).
+# Simpan sebagai .github/workflows/termux-wheels.yml di repo GitHub Anda.
+#
+# Runner arm64 (ubuntu-24.04-arm) gratis untuk repo PUBLIK. Untuk repo privat,
+# ganti runs-on ke ubuntu-latest dan tambah step docker/setup-qemu-action
+# (jauh lebih lambat).
+name: termux-wheels
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Branch/tag/commit NousResearch/hermes-agent"
+        default: "main"
+
+permissions:
+  contents: write
+
+jobs:
+  wheelhouse:
+    runs-on: ubuntu-26.04-arm
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          repository: NousResearch/hermes-agent
+          ref: ${{ inputs.ref }}
+          path: src
+          persist-credentials: false
+
+      - name: Build wheelhouse di Termux-Docker
+        run: |
+          mkdir -p out && chmod 777 out
+          cat > build.sh <<'EOF'
+          set -euo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+
+          apt-get update
+          apt-get -y -o Dpkg::Options::=--force-confnew upgrade
+          apt-get -y install python git clang make cmake pkg-config rust \
+            libffi openssl libheif libjpeg-turbo libpng freetype libwebp \
+            littlecms libtiff openjpeg
+
+          # Pastikan minor Python sama dengan HP (3.14) dan platform 'android'
+          python - <<'PY'
+          import sys, sysconfig
+          print(sys.version, sys.platform, sysconfig.get_platform())
+          assert sys.version_info[:2] == (3, 14), "Python bukan 3.14"
+          PY
+
+          # Dari wiki Termux untuk paket berbasis Rust/maturin (belum diuji di sini)
+          export ANDROID_API_LEVEL=24
+
+          cp -r /src "$HOME/src"
+          cd "$HOME/src"
+          python -m venv "$HOME/b"
+          . "$HOME/b/bin/activate"
+          pip install -U pip
+
+          # Seluruh closure .[termux]: wheel yang sudah ada diunduh,
+          # sisanya (termasuk psutil dari commit git) dikompilasi.
+          pip wheel ".[termux]" -w /out
+
+          # Build backend untuk install editable offline di HP
+          pip download "setuptools==84.1.0" wheel --no-deps -d /out
+
+          rm -f /out/hermes_agent-*.whl
+          ls -1 /out
+          EOF
+
+          docker run --rm \
+            -v "$PWD/src:/src:ro" \
+            -v "$PWD/out:/out" \
+            -v "$PWD/build.sh:/build.sh:ro" \
+            termux/termux-docker:aarch64 bash /build.sh
+
+      - name: Kemas dan publikasikan ke Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ls out | wc -l
+          tar -C out -czf wheelhouse.tar.gz .
+          gh release delete wheelhouse-latest --yes --cleanup-tag --repo "$GITHUB_REPOSITORY" || true
+          gh release create wheelhouse-latest wheelhouse.tar.gz \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "Termux wheelhouse (cp314, android_24_arm64_v8a)" \
+            --notes "hermes-agent ref: ${{ inputs.ref }}"
