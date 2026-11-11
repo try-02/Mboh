@@ -53,7 +53,11 @@ jobs:
           mkdir -p /tmp/bh && cd /tmp/bh
           pip download "browser-harness==0.1.13" --no-deps
           python -m wheel unpack browser_harness-*.whl
-          sed -i 's/pillow==12.3.0/pillow>=12.3.0/g' browser_harness-*/browser_harness-*.dist-info/METADATA
+          
+          # Patch dependensi pillow
+          sed -i -E 's/[pP]illow==12\.3\.0/Pillow>=12.3.0/g' browser_harness-*/browser_harness-*.dist-info/METADATA
+          
+          # Pack ulang folder direktori ke /out dengan build number 1
           python -m wheel pack browser_harness-* -d /out --build-number 1
           cd "$HOME/src"
 
