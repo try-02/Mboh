@@ -42,6 +42,7 @@ jobs:
           PY
 
           export ANDROID_API_LEVEL=24
+          export HERMES_NIX_BUILD=1
 
           cp -r /src "$HOME/src"
           cd "$HOME/src"
@@ -50,7 +51,7 @@ jobs:
           pip install -U pip wheel
 
           # Patch browser-harness agar tidak bentrok dengan Pillow 13.0.0
-          mkdir -p /tmp/bh && cd /tmp/bh
+          mkdir -p "$HOME/bh_tmp" && cd "$HOME/bh_tmp"
           pip download "browser-harness==0.1.13" --no-deps
           python -m wheel unpack browser_harness-*.whl
           rm -f *.whl
