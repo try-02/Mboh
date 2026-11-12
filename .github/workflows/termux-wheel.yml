@@ -32,7 +32,7 @@ jobs:
           apt-get update
           apt-get -y -o Dpkg::Options::=--force-confnew upgrade
           apt-get -y install python git clang make cmake pkg-config rust \
-            libffi openssl libheif libjpeg-turbo libpng freetype libwebp \
+            libffi openssl libxml2 libxslt libheif libjpeg-turbo libpng freetype libwebp \
             littlecms libtiff openjpeg
 
           python - <<'PY'
