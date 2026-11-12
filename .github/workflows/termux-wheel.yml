@@ -61,7 +61,7 @@ jobs:
           cd "$HOME/src"
 
           # Build seluruh closure dengan referensi ke wheel yang sudah dipatch
-          pip wheel ".[termux,exa,firecrawl,ddgs,ruamel.yaml.clib==0.2.15]" -w /out --find-links /out
+          pip wheel ".[termux,exa,firecrawl,ddgs]" -w /out --find-links /out
 
           # Build backend untuk install editable offline di HP
           pip download "setuptools==84.1.0" wheel --no-deps -d /out
