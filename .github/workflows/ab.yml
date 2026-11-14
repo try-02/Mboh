@@ -46,7 +46,7 @@ jobs:
 
           python -m venv "$HOME/b"
           . "$HOME/b/bin/activate"
-          pip install -U pip wheel setuptools build
+          pip install -U pip wheel setuptools build httpx
 
           # =====================================================================
           # 1. BUAT STUB WHEEL UNTUK NEMO-RELAY (Murni Python / No-Op)
