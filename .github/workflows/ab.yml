@@ -98,7 +98,9 @@ jobs:
           cd "$HOME"
 
           # =====================================================================
-          # 2. BUAT SHIM WHEEL UNTUK PRIMP (Pengganti Rust dengan HTTPX)
+          # 2. BUAT SHIM WHEEL UNTUK PRIMP (pengganti Rust, berbasis HTTPX)
+          #    Versi 2.0.1+termux: lebih tinggi dari primp 2.0.1 di PyPI, tapi tetap
+          #    memenuhi primp>=1.3.1 (ddgs) dan primp==2.0.1 (uv.lock Hermes).
           # =====================================================================
           mkdir -p "$HOME/primp_shim" && cd "$HOME/primp_shim"
           cat > pyproject.toml <<'PYP'
@@ -108,84 +110,160 @@ jobs:
 
           [project]
           name = "primp"
-          version = "1.3.1"
-          description = "Pure Python shim primp berbasis HTTPX untuk Termux"
-          dependencies = ["httpx>=0.25.0"]
+          version = "2.0.1+termux"
+          description = "Shim primp murni Python (httpx) untuk Termux; hanya API yang dipakai ddgs"
+          dependencies = ["httpx>=0.26.0", "lxml"]
+
+          [tool.setuptools]
+          packages = ["primp"]
           PYP
 
           mkdir -p primp
           cat > primp/__init__.py <<'PYP'
+          """Shim primp berbasis httpx (hanya API yang dipakai ddgs 9.x)."""
+          from __future__ import annotations
+
+          import ssl
+          from urllib.parse import urlparse
+
           import httpx
 
-          class ResponseWrapper:
+          __version__ = "2.0.1"
+
+          _UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                 "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
+          _DEFAULT_HEADERS = {
+              "User-Agent": _UA,
+              "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+              "Accept-Language": "en-US,en;q=0.9",
+          }
+
+
+          class TimeoutError(Exception):  # noqa: A001 - sengaja sama dengan primp.TimeoutError
+              """Dilempar saat request melewati batas waktu (ddgs menangkap ini)."""
+
+
+          def _plain_text(html_text: str) -> str:
+              try:
+                  from lxml import html as _lh
+                  return _lh.fromstring(html_text).text_content().strip()
+              except Exception:
+                  return html_text
+
+
+          class Response:
               def __init__(self, resp: httpx.Response):
                   self._resp = resp
                   self.status_code = resp.status_code
-                  self.text = resp.text
                   self.content = resp.content
                   self.headers = resp.headers
                   self.url = str(resp.url)
-                  self.cookies = resp.cookies
+                  self.encoding = resp.encoding
+
+              @property
+              def text(self) -> str:
+                  return self._resp.text
+
+              @property
+              def cookies(self) -> dict:
+                  return dict(self._resp.cookies)
+
+              # Dipakai DDGS().extract(); versi sederhana tanpa render markdown/rich.
+              @property
+              def text_plain(self) -> str:
+                  return _plain_text(self.text)
+
+              text_markdown = text_plain
+              text_rich = text_plain
+
               def json(self):
                   return self._resp.json()
 
+
           class Client:
-              def __init__(self, *args, **kwargs):
-                  headers = kwargs.get("headers") or {}
-                  if isinstance(headers, dict):
-                      headers = dict(headers)
-                  headers.setdefault("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36")
-                  self._client = httpx.Client(
-                      headers=headers,
-                      proxy=kwargs.get("proxy"),
-                      timeout=kwargs.get("timeout", 10.0),
-                      follow_redirects=kwargs.get("follow_redirects", True),
-                      verify=kwargs.get("verify", True)
+              def __init__(self, *args, proxy=None, timeout=30, verify=True, ca_cert_file=None,
+                           headers=None, follow_redirects=True, **_ignored):
+                  # impersonate/impersonate_os/cookie_store/referer/dst. diabaikan (tidak ada TLS fingerprint).
+                  if ca_cert_file:
+                      verify = ssl.create_default_context(cafile=ca_cert_file)
+                  merged = dict(_DEFAULT_HEADERS)
+                  merged.update(headers or {})
+                  self._c = httpx.Client(
+                      headers=merged, proxy=proxy, verify=verify,
+                      timeout=30 if timeout is None else timeout,
+                      follow_redirects=follow_redirects,
                   )
-              def get(self, url, **kwargs):
-                  # Filter argumen spesifik primp jika ada
-                  kwargs.pop("impersonate", None)
-                  return ResponseWrapper(self._client.get(url, **kwargs))
-              def post(self, url, **kwargs):
-                  kwargs.pop("impersonate", None)
-                  return ResponseWrapper(self._client.post(url, **kwargs))
+
+              # --- API primp yang dipakai ddgs ---
+              @property
+              def headers(self):
+                  return self._c.headers
+
+              @headers.setter
+              def headers(self, value):
+                  self._c.headers.update(value or {})
+
+              def headers_update(self, headers=None):
+                  self._c.headers.update(headers or {})
+
+              def set_cookies(self, url, cookies):
+                  u = urlparse(url if "//" in url else f"//{url}")
+                  host = u.hostname or url
+                  # tanpa skema ("google.com") -> berlaku juga untuk subdomain (www.google.com)
+                  domain = host if "//" in url else f".{host.lstrip('.')}"
+                  for k, v in (cookies or {}).items():
+                      self._c.cookies.set(k, v, domain=domain)
+
+              def get_cookies(self, url):
+                  host = urlparse(url if "//" in url else f"//{url}").hostname
+                  return {c.name: c.value for c in self._c.cookies.jar
+                          if host and (host == c.domain.lstrip(".") or host.endswith(c.domain))}
+
+              def request(self, method, url, *args, params=None, headers=None, cookies=None,
+                          content=None, data=None, json=None, auth=None, timeout=None,
+                          follow_redirects=None, **_ignored):
+                  if cookies:
+                      self.set_cookies(url, cookies)
+                  if params:  # httpx mengganti seluruh query URL; primp menggabungkannya
+                      url = str(httpx.URL(url).copy_merge_params(params))
+                  params = None
+                  if isinstance(data, (str, bytes)):
+                      content, data = data, None
+                  kw = {}
+                  if timeout is not None:
+                      kw["timeout"] = timeout
+                  if follow_redirects is not None:
+                      kw["follow_redirects"] = follow_redirects
+                  try:
+                      r = self._c.request(method, url, params=params, headers=headers,
+                                          content=content, data=data, json=json, auth=auth, **kw)
+                  except httpx.TimeoutException as ex:
+                      raise TimeoutError(str(ex)) from ex
+                  return Response(r)
+
+              def get(self, url, **kw):
+                  return self.request("GET", url, **kw)
+
+              def post(self, url, **kw):
+                  return self.request("POST", url, **kw)
+
+              def head(self, url, **kw):
+                  return self.request("HEAD", url, **kw)
+
               def close(self):
-                  self._client.close()
+                  self._c.close()
+
               def __enter__(self):
                   return self
-              def __exit__(self, *args):
-                  self.close()
 
-          class AsyncClient:
-              def __init__(self, *args, **kwargs):
-                  headers = kwargs.get("headers") or {}
-                  if isinstance(headers, dict):
-                      headers = dict(headers)
-                  headers.setdefault("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36")
-                  self._client = httpx.AsyncClient(
-                      headers=headers,
-                      proxy=kwargs.get("proxy"),
-                      timeout=kwargs.get("timeout", 10.0),
-                      follow_redirects=kwargs.get("follow_redirects", True),
-                      verify=kwargs.get("verify", True)
-                  )
-              async def get(self, url, **kwargs):
-                  kwargs.pop("impersonate", None)
-                  r = await self._client.get(url, **kwargs)
-                  return ResponseWrapper(r)
-              async def post(self, url, **kwargs):
-                  kwargs.pop("impersonate", None)
-                  r = await self._client.post(url, **kwargs)
-                  return ResponseWrapper(r)
-              async def aclose(self):
-                  await self._client.aclose()
-              async def __aenter__(self):
-                  return self
-              async def __aexit__(self, *args):
-                  await self.aclose()
+              def __exit__(self, *a):
+                  self.close()
           PYP
           python -m build --wheel --outdir /out
           cd "$HOME"
+
+          # Constraint: paksa pip memakai shim (bukan sdist Rust dari PyPI, juga bila primp rilis versi baru)
+          echo "primp==2.0.1+termux" > "$HOME/constraints.txt"
 
           # =====================================================================
           # 3. PATCH BROWSER-HARNESS (Pillow compatibility)
@@ -200,16 +278,43 @@ jobs:
           # =====================================================================
           # 4. RESOLVE & BUILD SELURUH DEPENDENCIES
           # =====================================================================
+          # --- Smoke test shim primp (gagal cepat bila API tidak lengkap) ---
+          pip install --no-index --find-links /out --force-reinstall --no-deps primp
+          python - <<'PYT'
+          import primp
+          c = primp.Client(impersonate="random", impersonate_os="random", timeout=10, verify=True, ca_cert_file=None)
+          for name in ("request", "get", "post", "headers_update", "set_cookies"):
+              assert hasattr(c, name), f"primp.Client.{name} tidak ada"
+          assert issubclass(primp.TimeoutError, Exception)
+          print("primp shim OK", primp.__version__)
+          PYT
+
+          # --- Smoke test stub nemo-relay ---
+          pip install --no-index --find-links /out --force-reinstall --no-deps nemo-relay
+          python - <<'PYT'
+          import nemo_relay
+          assert hasattr(nemo_relay, "scope"), "nemo_relay.scope tidak ada"
+          print("nemo_relay stub OK", nemo_relay.__version__)
+          PYT
+
           cp -r /src "$HOME/src"
           cd "$HOME/src"
 
-          # Pip otomatis memilih wheel nemo-relay dan primp yang sudah ada di /out
-          pip wheel ".[termux-all,exa,firecrawl,ddgs]" -w /out --find-links /out
+          # Build seluruh closure dependencies:
+          # - Menggunakan constraints.txt agar primp dipaksa mengonsumsi wheel shim murni Python
+          # - Menggunakan --find-links /out agar mendahulukan wheel lokal yang sudah dipatch
+          pip wheel ".[termux-all,exa,firecrawl,ddgs]" \
+            -w /out \
+            --find-links /out \
+            -c "$HOME/constraints.txt"
 
-          # Download tools backend untuk setup lokal
+          # Download setuptools & wheel untuk keperluan install editable (-e) offline di Termux
           pip download "setuptools==84.1.0" wheel --no-deps -d /out
 
+          # Hapus wheel hermes-agent sendiri (agar di HP diinstall editable via git source)
           rm -f /out/hermes_agent-*.whl
+
+          echo "=== DAFTAR WHEEL YANG BERHASIL DIBUILD ==="
           ls -1 /out
           EOF
 
