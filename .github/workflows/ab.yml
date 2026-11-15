@@ -68,13 +68,47 @@ jobs:
           cat > nemo_relay/__init__.py <<'PYP'
           __version__ = "0.11.1"
 
+          class ScopeValue(str):
+              def __eq__(self, other):
+                  if isinstance(other, str): return self.lower() == other.lower()
+                  return super().__eq__(other)
+              def __hash__(self): return hash(self.lower())
+
+          class _ScopeTypeMeta(type):
+              def __getattr__(cls, name: str):
+                  val = ScopeValue(name.lower())
+                  setattr(cls, name, val)
+                  return val
+
+          class ScopeType(metaclass=_ScopeTypeMeta):
+              Agent = ScopeValue("agent")
+              Function = ScopeValue("function")
+              Tool = ScopeValue("tool")
+              Llm = ScopeValue("llm")
+              LLM = ScopeValue("llm")
+
           class _NoOp:
               def __getattr__(self, name): return _NoOp()
-              def __call__(self, *args, **kwargs): return _NoOp()
+              def __call__(self, *args, **kwargs):
+                  for a in args:
+                      if hasattr(a, "__aiter__") or hasattr(a, "__anext__"): return a
+                  for v in kwargs.values():
+                      if hasattr(v, "__aiter__") or hasattr(v, "__anext__"): return v
+                  if args: return args[0]
+                  return _NoOp()
               def __enter__(self): return self
               def __exit__(self, *args): pass
               async def __aenter__(self): return self
               async def __aexit__(self, *args): pass
+              def __aiter__(self): return self
+              async def __anext__(self): raise StopAsyncIteration
+              def __bool__(self): return True
+
+          class ToolExecutionResult(dict):
+              def __init__(self, data=None, **kwargs):
+                  super().__init__()
+                  if data: self.update(data)
+                  self.update(kwargs)
 
           scope = _NoOp()
           tools = _NoOp()
@@ -83,16 +117,8 @@ jobs:
           plugin = _NoOp()
           subscribers = _NoOp()
 
-          class ToolExecutionResult(dict):
-              def __init__(self, data=None, **kwargs):
-                  super().__init__()
-                  if data: self.update(data)
-                  self.update(kwargs)
-
-          class ScopeType:
-              Agent = "agent"
-              Tool = "tool"
-              LLM = "llm"
+          def __getattr__(name: str):
+              return _NoOp()
           PYP
           python -m build --wheel --outdir /out
           cd "$HOME"
