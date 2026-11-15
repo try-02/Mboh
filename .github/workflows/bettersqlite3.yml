@@ -1,4 +1,4 @@
-name: build-better-sqlite3-termux-v1
+name: build-better-sqlite3-termux
 
 # Build better_sqlite3.node untuk Termux (aarch64, bionic) di dalam Docker Termux.
 # Simpan sebagai .github/workflows/build-better-sqlite3-termux.yml
@@ -6,7 +6,7 @@ name: build-better-sqlite3-termux-v1
 #
 # Cek versi yang dibutuhkan OmniRoute di HP:
 #   node -p "require('$(npm root -g)/omniroute/package.json').dependencies['better-sqlite3']"
-# Cek ABI Node di HP (harus sama dengan hasil build; ABI sama selama versi mayor Node sama):
+# Cek ABI Node di HP:
 #   node -p process.versions.modules
 
 on:
@@ -61,7 +61,7 @@ jobs:
           apt-get -y install "$NODEJS_PKG" python build-essential
           python -m pip install --quiet setuptools || true
 
-          # Aktifkan termux-exec setelah upgrade/install agar shebang /bin/sh & /usr/bin/env di node-gyp berjalan
+          # Aktifkan termux-exec agar shebang /bin/sh & /usr/bin/env di node-gyp/make berjalan
           if [ -f "$PREFIX/lib/libtermux-exec-ld-preload.so" ] && [[ ":${LD_PRELOAD:-}:" != *":$PREFIX/lib/libtermux-exec-ld-preload.so:"* ]]; then
             export LD_PRELOAD="$PREFIX/lib/libtermux-exec-ld-preload.so${LD_PRELOAD:+:$LD_PRELOAD}"
           fi
@@ -74,13 +74,40 @@ jobs:
           # Workaround node-gyp di Termux + pakai header Node dari paket (tanpa download)
           mkdir -p "$HOME/.gyp"
           printf "{'variables':{'android_ndk_path':''}}\n" > "$HOME/.gyp/include.gypi"
-          export npm_config_nodedir="$PREFIX"
-          export npm_config_build_from_source=true
+          export GYP_DEFINES="android_ndk_path=''"
+          export npm_package_config_node_gyp_nodedir="$PREFIX"
+
+          # Cari node-gyp bawaan npm (fallback install global jika belum ada)
+          NODE_GYP=""
+          NPM_ROOT="$(npm root -g)"
+          for p in \
+            "$NPM_ROOT/npm/node_modules/node-gyp/bin/node-gyp.js" \
+            "$PREFIX/lib/node_modules/npm/node_modules/node-gyp/bin/node-gyp.js" \
+            "$NPM_ROOT/node-gyp/bin/node-gyp.js"
+          do
+            if [ -f "$p" ]; then
+              NODE_GYP="$p"
+              break
+            fi
+          done
+          if [ -z "$NODE_GYP" ]; then
+            npm install -g node-gyp --no-audit --no-fund
+            NODE_GYP="$NPM_ROOT/node-gyp/bin/node-gyp.js"
+          fi
 
           # Build di folder terpisah (bukan di dalam node_modules/omniroute)
           W="$HOME/w"; rm -rf "$W"; mkdir -p "$W"; cd "$W"
           printf '{"name":"omniroute-runtime","private":true,"version":"0.0.0"}\n' > package.json
-          npm install "better-sqlite3@${SQLITE_VERSION}" --save-exact --build-from-source --no-audit --no-fund
+
+          # Install tanpa menjalankan lifecycle script (kompatibel penuh dengan npm 12)
+          npm install "better-sqlite3@${SQLITE_VERSION}" --save-exact --ignore-scripts --no-audit --no-fund
+
+          # Kompilasi native addon secara langsung lewat node-gyp
+          (
+            cd node_modules/better-sqlite3
+            rm -rf prebuilds build
+            node "$NODE_GYP" rebuild --release --nodedir="$PREFIX"
+          )
 
           NODE_FILE="node_modules/better-sqlite3/build/Release/better_sqlite3.node"
           test -f "$NODE_FILE"
