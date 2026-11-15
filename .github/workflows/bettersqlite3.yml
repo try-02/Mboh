@@ -1,0 +1,152 @@
+name: build-better-sqlite3-termux-v1
+
+# Build better_sqlite3.node untuk Termux (aarch64, bionic) di dalam Docker Termux.
+# Simpan sebagai .github/workflows/build-better-sqlite3-termux.yml
+# Jalankan manual: Actions -> build-better-sqlite3-termux -> Run workflow.
+#
+# Cek versi yang dibutuhkan OmniRoute di HP:
+#   node -p "require('$(npm root -g)/omniroute/package.json').dependencies['better-sqlite3']"
+# Cek ABI Node di HP (harus sama dengan hasil build; ABI sama selama versi mayor Node sama):
+#   node -p process.versions.modules
+
+on:
+  workflow_dispatch:
+    inputs:
+      sqlite_version:
+        description: "Versi better-sqlite3 (samakan dengan dependensi OmniRoute di HP)"
+        required: true
+        default: "13.2.0"
+      nodejs_pkg:
+        description: "Paket Node.js Termux: nodejs (terbaru) atau nodejs-lts"
+        required: true
+        default: "nodejs"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    # Runner arm64 -> image Termux aarch64 jalan native (cepat).
+    # Untuk repo privat / runner x64: ganti ke ubuntu-latest, langkah QEMU di bawah otomatis aktif.
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 40
+    env:
+      SQLITE_VERSION: ${{ inputs.sqlite_version }}
+      NODEJS_PKG: ${{ inputs.nodejs_pkg }}
+    steps:
+      - name: Siapkan QEMU (hanya bila runner bukan arm64)
+        if: runner.arch != 'ARM64'
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - name: Tulis skrip build
+        run: |
+          mkdir -p out && chmod 777 out
+
+          # Tulis env ke file karena /entrypoint.sh termux-docker mereset env saat drop privilege ke user system
+          printf 'SQLITE_VERSION=%q\nNODEJS_PKG=%q\n' \
+            "${SQLITE_VERSION}" "${NODEJS_PKG}" > build.env
+
+          cat > build.sh <<'EOS'
+          #!/data/data/com.termux/files/usr/bin/bash
+          set -euxo pipefail
+          source /build.env
+          export DEBIAN_FRONTEND=noninteractive
+          PREFIX="${PREFIX:-/data/data/com.termux/files/usr}"
+          OUT=/out
+
+          apt-get update
+          apt-get -y -o Dpkg::Options::=--force-confnew full-upgrade
+          apt-get -y install "$NODEJS_PKG" python build-essential
+          python -m pip install --quiet setuptools || true
+
+          # Aktifkan termux-exec setelah upgrade/install agar shebang /bin/sh & /usr/bin/env di node-gyp berjalan
+          if [ -f "$PREFIX/lib/libtermux-exec-ld-preload.so" ] && [[ ":${LD_PRELOAD:-}:" != *":$PREFIX/lib/libtermux-exec-ld-preload.so:"* ]]; then
+            export LD_PRELOAD="$PREFIX/lib/libtermux-exec-ld-preload.so${LD_PRELOAD:+:$LD_PRELOAD}"
+          fi
+
+          node -v; npm -v; clang --version | head -1
+          NODEV="$(node -p process.version)"
+          ABI="$(node -p process.versions.modules)"
+          test -f "$PREFIX/include/node/node.h"
+
+          # Workaround node-gyp di Termux + pakai header Node dari paket (tanpa download)
+          mkdir -p "$HOME/.gyp"
+          printf "{'variables':{'android_ndk_path':''}}\n" > "$HOME/.gyp/include.gypi"
+          export npm_config_nodedir="$PREFIX"
+          export npm_config_build_from_source=true
+
+          # Build di folder terpisah (bukan di dalam node_modules/omniroute)
+          W="$HOME/w"; rm -rf "$W"; mkdir -p "$W"; cd "$W"
+          printf '{"name":"omniroute-runtime","private":true,"version":"0.0.0"}\n' > package.json
+          npm install "better-sqlite3@${SQLITE_VERSION}" --save-exact --build-from-source --no-audit --no-fund
+
+          NODE_FILE="node_modules/better-sqlite3/build/Release/better_sqlite3.node"
+          test -f "$NODE_FILE"
+          echo "magic: $(od -An -tx1 -N4 "$NODE_FILE")"   # harus 7f 45 4c 46 (ELF)
+          readelf -h "$NODE_FILE" | grep -E 'Class|Machine' || true
+
+          TEST='const D=require("better-sqlite3");const db=new D(":memory:");
+          db.exec("create table t(a); insert into t values (1),(2)");
+          console.log(db.prepare("select sqlite_version() v, (select count(*) from t) c").get());'
+          node -e "$TEST"
+
+          VER="$(node -p "require('./node_modules/better-sqlite3/package.json').version")"
+          NAME="better-sqlite3-${VER}-termux-aarch64-node${NODEV#v}-abi${ABI}"
+
+          # Paket siap-ekstrak ke ~/.omniroute/runtime/ (tata letak npm standar)
+          tar czf "$OUT/$NAME.tgz" \
+            --exclude='node_modules/better-sqlite3/deps' \
+            --exclude='node_modules/better-sqlite3/src' \
+            --exclude='node_modules/better-sqlite3/build/Release/obj*' \
+            --exclude='node_modules/better-sqlite3/build/Release/.deps' \
+            --exclude='node_modules/better-sqlite3/build/deps' \
+            package.json node_modules
+
+          # Verifikasi isi tarball: ekstrak ke folder bersih lalu uji muat
+          V="$HOME/verify"; rm -rf "$V"; mkdir -p "$V"
+          tar xzf "$OUT/$NAME.tgz" -C "$V"
+          (cd "$V" && node -e "$TEST")
+
+          cp "$NODE_FILE" "$OUT/better_sqlite3.node"
+          {
+            echo "better-sqlite3: $VER"
+            echo "node: $NODEV (ABI $ABI)"
+            echo "npm: $(npm -v)"
+            echo "clang: $(clang --version | head -1)"
+            echo "arch: $(uname -m)"
+            echo "built: $(date -u +%FT%TZ)"
+            echo "tarball: $NAME.tgz"
+          } > "$OUT/BUILD_INFO.txt"
+          (cd "$OUT" && sha256sum * > SHA256SUMS)
+          ls -la "$OUT"
+          EOS
+
+          chmod 644 build.env build.sh
+
+      - name: Build di Docker Termux
+        run: |
+          docker run --rm --platform linux/arm64 \
+            -v "$PWD/out:/out" \
+            -v "$PWD/build.env:/build.env:ro" \
+            -v "$PWD/build.sh:/build.sh:ro" \
+            termux/termux-docker:aarch64 bash /build.sh
+
+      - name: Ringkasan
+        run: |
+          {
+            echo '### better-sqlite3 untuk Termux'
+            echo '```'
+            cat out/BUILD_INFO.txt
+            echo '```'
+            echo 'Cek di HP: `node -p process.versions.modules` harus sama dengan ABI di atas.'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Unggah artefak
+        uses: actions/upload-artifact@v4
+        with:
+          name: better-sqlite3-termux-aarch64
+          path: out/
+          retention-days: 14
+          if-no-files-found: error
